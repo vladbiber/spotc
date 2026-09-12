@@ -1,8 +1,8 @@
 # spotc
 
 Spotify client for the terminal, written in C. Browse your library, control any
-Spotify Connect device, and play locally through a built-in slowed + reverb
-effect chain.
+Spotify Connect device, and play locally through a built-in speed, reverb and
+bass-boost effect chain.
 
 Requires Spotify Premium.
 
@@ -15,7 +15,7 @@ Requires Spotify Premium.
 ├─────────────────────────────────────────────────────────┤
 │ ▶ Track one — Artist                       1:23 / 3:41  │
 │ ━━━━━━━●─────────────────────────────────────────────── │
-│ vol 80% · 0.86x slow · rev 18%                  ? keys  │
+│ vol 80% · 1.35x fast · rev 18% · bass boost     ? keys  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -28,9 +28,14 @@ Requires Spotify Premium.
   repeat, queue, device switching
 - Local playback device via librespot, so sound comes out of the machine
   spotc runs on
-- Slowed + reverb: a cubic-Hermite resampler (pitch drops with speed, as it
-  should) and a Freeverb implementation, applied live to the local audio with
-  smooth transitions — 8 gradual levels or exact values in the config
+- Variable playback speed from 0.50x to 2.00x through a cubic-Hermite
+  resampler (pitch follows speed), with 12 gradual levels and smooth live
+  transitions
+- Toggleable bass boost and a Freeverb implementation, both applied live to
+  normal and reverse local audio; exact values can also be set in the config
+- Continuous exact-reverse mode for the local device: each track is decoded
+  once, cached and played from its last sample to its first; the next track is
+  then started automatically in reverse too
 - Every key rebindable in a plain-text config, 256-color accent theming
 
 ## How it works
@@ -45,6 +50,13 @@ writes it processed to stdout; spotc controls it at runtime through a FIFO.
 The effects only apply to the local `spotc` device — Spotify's API does not
 expose audio from other Connect devices.
 
+Exact reverse needs the future audio before it can begin. Pressing `R` enables
+reverse mode: `spotc-reverse-cache` decodes each complete track as fast as the
+network allows, then `spotc-fx` reads its PCM file strictly from end to
+beginning. At the beginning of one track, the next track is prepared and starts
+in reverse automatically. Decoded tracks are reused from
+`~/.cache/spotc/reverse/`; press `R` again to return to normal playback.
+
 `spotc-ipv4.so` is preloaded into librespot to force IPv4 name resolution:
 routers that advertise IPv6 without working upstream otherwise break
 librespot's websocket connection (`Network is unreachable`) and the local
@@ -52,7 +64,7 @@ device never appears. Harmless when IPv6 works.
 
 ## Dependencies
 
-- ncursesw, json-c, libcurl, openssl (build)
+- ncursesw, json-c, libcurl, openssl, Rust/Cargo (build)
 - [librespot](https://github.com/librespot-org/librespot) ≥ 0.8 —
   `cargo install librespot --locked` (without `--locked` the build fails)
 - `pacat` (pulseaudio-utils; PipeWire's pulse compatibility works fine)
@@ -74,7 +86,7 @@ API key — one-time, about two minutes:
 2. Run `spotc`, press `i`, paste the Client ID.
 3. Press `l` and sign in in the browser.
 
-For local audio (and the slow/reverb effects), pair the device once: open
+For local audio (and the local effects), pair the device once: open
 Spotify on your phone → Devices → pick `spotc`.
 
 ## Keys
@@ -86,10 +98,11 @@ Spotify on your phone → Devices → pick `spotc`.
 | `n` `b` | next / previous | `,` `.` | seek ±10s |
 | `-` `+` | volume | `a` | add to queue |
 | `s` | shuffle | `r` | repeat |
-| `o` | slow+reverb on/off | `p` | next of 8 levels |
-| `0` | reset fx | `/` | search |
-| `d` | devices | `?` | help |
-| `R` | reload library | `X` | logout |
+| `R` | reverse mode on/off (all tracks) | `L` | reload library |
+| `o` | faster (up to 2.00x) | `p` | slower (down to 0.50x) |
+| `B` | bass boost on/off | `0` | reset fx |
+| `/` | search | `d` | devices |
+| `?` | help | `X` | logout |
 | `q` | quit | | |
 
 All of them can be changed in `~/.config/spotc/config`, which also holds

@@ -23,13 +23,14 @@ typedef struct {
     int bitrate;     /* 96 / 160 / 320 */
     float speed;     /* persisted fx defaults */
     float reverb;
+    float bass;      /* 0.0 = off, 1.0 = full bass boost */
     float retune;    /* tuning ratio, 1.0 = A4 440 Hz */
 
     /* All textual controls can be changed in ~/.config/spotc/config. */
     int key_quit, key_focus, key_down, key_up, key_top, key_bottom;
     int key_play_pause, key_next, key_prev, key_seek_back, key_seek_forward;
-    int key_volume_down, key_volume_up, key_shuffle, key_repeat, key_queue;
-    int key_slow_reverb, key_more_slow_reverb, key_fx_reset, key_retune;
+    int key_volume_down, key_volume_up, key_shuffle, key_repeat, key_reverse, key_queue;
+    int key_speed_up, key_speed_down, key_bass_boost, key_fx_reset, key_retune;
     int key_search, key_devices, key_help, key_reload, key_logout;
     int key_client_id, key_login;
 } Config;
@@ -116,7 +117,14 @@ typedef struct App {
     int pipeline_up;
     float speed;
     float reverb;
+    float bass;
     float retune;    /* multiplies speed in the fx chain, never shown as "slow" */
+    int reverse;     /* continuous exact-reverse mode is enabled */
+    int reverse_was_playing;
+    int reverse_progress_ms;
+    Track *reverse_tracks;  /* snapshot of the list whose tracks are reversing */
+    int n_reverse_tracks;
+    int reverse_index;
 
     char status[256];
 } App;
@@ -176,6 +184,7 @@ int api_fetch_devices(App *a);
 int api_transfer(App *a, const char *device_id);
 int api_play_context(App *a, const char *ctx_uri, int offset, const char *dev_id);
 int api_play_uri(App *a, const char *uri, const char *dev_id);
+int api_play_uri_at(App *a, const char *uri, int position_ms, const char *dev_id);
 int api_play_tracks(App *a, const Track *tracks, int n_tracks, int start,
                     const char *dev_id);
 int api_pause(App *a);
@@ -190,10 +199,13 @@ int api_queue_add(App *a, const char *uri);
 
 /* player.c */
 int player_start(App *a);            /* spawn librespot | spotc-fx | pacat */
+int player_cache_reverse(App *a, char *path, size_t n); /* decode current track */
+int player_start_reverse(App *a, const char *path);     /* reverse file | pacat */
+void player_reverse_pause(App *a, int paused);
 int player_oauth_login(App *a);      /* librespot -j browser sign-in; 0 on success */
 int player_check(App *a);            /* reap children; 1 = pipeline died */
 void player_stop(App *a);
-void player_set_fx(App *a);          /* push speed/reverb to spotc-fx */
+void player_set_fx(App *a);          /* push speed/reverb/bass to spotc-fx */
 const char *player_librespot_path(void);
 
 /* ui.c */

@@ -477,6 +477,15 @@ int api_play_uri(App *a, const char *uri, const char *dev_id) {
     return api_send(a, "PUT", path, body);
 }
 
+int api_play_uri_at(App *a, const char *uri, int position_ms, const char *dev_id) {
+    char path[192], body[320];
+    if (position_ms < 0) position_ms = 0;
+    play_path(path, sizeof path, dev_id);
+    snprintf(body, sizeof body, "{\"uris\":[\"%s\"],\"position_ms\":%d}",
+             uri, position_ms);
+    return api_send(a, "PUT", path, body);
+}
+
 int api_play_tracks(App *a, const Track *tracks, int n_tracks, int start,
                     const char *dev_id) {
     if (start < 0 || start >= n_tracks) return -1;

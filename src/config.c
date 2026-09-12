@@ -41,12 +41,14 @@ static void default_keys(Config *c) {
     c->key_prev = 'b';             c->key_seek_back = ',';
     c->key_seek_forward = '.';     c->key_volume_down = '-';
     c->key_volume_up = '+';        c->key_shuffle = 's';
-    c->key_repeat = 'r';           c->key_queue = 'a';
-    c->key_slow_reverb = 'o';      c->key_more_slow_reverb = 'p';
+    c->key_repeat = 'r';           c->key_reverse = 'R';
+    c->key_queue = 'a';
+    c->key_speed_up = 'o';         c->key_speed_down = 'p';
+    c->key_bass_boost = 'B';
     c->key_fx_reset = '0';         c->key_retune = 'h';
     c->key_search = '/';
     c->key_devices = 'd';          c->key_help = '?';
-    c->key_reload = 'R';           c->key_logout = 'X';
+    c->key_reload = 'L';           c->key_logout = 'X';
     c->key_client_id = 'i';
     c->key_login = 'l';
 }
@@ -117,6 +119,7 @@ void config_load(Config *c) {
     c->bitrate = 320;
     c->speed = 1.0f;
     c->reverb = 0.0f;
+    c->bass = 0.0f;
     c->retune = 1.0f;
     default_keys(c);
 
@@ -124,6 +127,8 @@ void config_load(Config *c) {
     snprintf(path, sizeof path, "%s/config", spotc_dir());
     FILE *f = fopen(path, "r");
     if (!f) return;
+    int saw_key_reverse = 0, saw_speed_up = 0, saw_speed_down = 0;
+    int legacy_speed_up = 0, legacy_speed_down = 0;
     char line[512];
     while (fgets(line, sizeof line, f)) {
         char *hash = strchr(line, '#');
@@ -140,6 +145,7 @@ void config_load(Config *c) {
         else if (!strcmp(key, "bitrate")) c->bitrate = atoi(val);
         else if (!strcmp(key, "speed")) c->speed = strtof(val, NULL);
         else if (!strcmp(key, "reverb")) c->reverb = strtof(val, NULL);
+        else if (!strcmp(key, "bass")) c->bass = strtof(val, NULL);
         else if (!strcmp(key, "retune")) c->retune = strtof(val, NULL);
         else {
             read_key(key, val, "key_quit", &c->key_quit);
@@ -157,9 +163,24 @@ void config_load(Config *c) {
             read_key(key, val, "key_volume_up", &c->key_volume_up);
             read_key(key, val, "key_shuffle", &c->key_shuffle);
             read_key(key, val, "key_repeat", &c->key_repeat);
+            if (!strcmp(key, "key_reverse")) {
+                read_key(key, val, "key_reverse", &c->key_reverse);
+                saw_key_reverse = 1;
+            }
             read_key(key, val, "key_queue", &c->key_queue);
-            read_key(key, val, "key_slow_reverb", &c->key_slow_reverb);
-            read_key(key, val, "key_more_slow_reverb", &c->key_more_slow_reverb);
+            if (!strcmp(key, "key_speed_up")) {
+                read_key(key, val, "key_speed_up", &c->key_speed_up);
+                saw_speed_up = 1;
+            } else if (!strcmp(key, "key_slow_reverb")) {
+                read_key(key, val, "key_slow_reverb", &legacy_speed_up);
+            }
+            if (!strcmp(key, "key_speed_down")) {
+                read_key(key, val, "key_speed_down", &c->key_speed_down);
+                saw_speed_down = 1;
+            } else if (!strcmp(key, "key_more_slow_reverb")) {
+                read_key(key, val, "key_more_slow_reverb", &legacy_speed_down);
+            }
+            read_key(key, val, "key_bass_boost", &c->key_bass_boost);
             read_key(key, val, "key_fx_reset", &c->key_fx_reset);
             read_key(key, val, "key_retune", &c->key_retune);
             read_key(key, val, "key_search", &c->key_search);
@@ -174,8 +195,17 @@ void config_load(Config *c) {
         free(val);
     }
     fclose(f);
-    if (c->speed < 0.5f || c->speed > 1.5f) c->speed = 1.0f;
+    /* Before reverse mode existed, uppercase R was the reload default.  Old
+     * configs should gain the new binding without making the two actions
+     * collide; reload moves to the new uppercase-L default. */
+    if (!saw_key_reverse && c->key_reload == 'R') c->key_reload = 'L';
+    /* Keep customized bindings from configs written before the speed controls
+     * were split from the old slow+reverb presets. */
+    if (!saw_speed_up && legacy_speed_up) c->key_speed_up = legacy_speed_up;
+    if (!saw_speed_down && legacy_speed_down) c->key_speed_down = legacy_speed_down;
+    if (c->speed < 0.5f || c->speed > 2.0f) c->speed = 1.0f;
     if (c->reverb < 0.0f || c->reverb > 1.0f) c->reverb = 0.0f;
+    if (c->bass < 0.0f || c->bass > 1.0f) c->bass = 0.0f;
     if (c->retune < 0.8f || c->retune > 1.3f) c->retune = 1.0f;
 }
 
@@ -186,7 +216,8 @@ void config_save(const Config *c) {
     if (!f) return;
     char quit[8], focus[8], down[8], up[8], top[8], bottom[8], play[8];
     char next[8], prev[8], back[8], forward[8], vdown[8], vup[8], shuffle[8];
-    char repeat[8], queue[8], slow[8], more_slow[8], reset[8], retune[8], search[8];
+    char repeat[8], reverse[8], queue[8], speed_up[8], speed_down[8], bass[8];
+    char reset[8], retune[8], search[8];
     char devices[8], help[8], reload[8], logout[8], client_id[8], login[8];
     fprintf(f,
         "# spotc config\n"
@@ -195,20 +226,21 @@ void config_save(const Config *c) {
         "accent = %d          # 256-color index for highlights\n"
         "dim = %d             # 256-color index for secondary text\n"
         "bitrate = %d         # 96 / 160 / 320\n"
-        "speed = %.2f         # 0.50 - 1.50, 1.00 = normal\n"
+        "speed = %.2f         # 0.50 - 2.00, 1.00 = normal\n"
         "reverb = %.2f        # 0.00 - 1.00\n"
+        "bass = %.2f          # 0.00 = off, 1.00 = bass boost\n"
         "retune = %.4f       # tuning ratio vs A4=440 (0.9818 = 432 Hz), 1.0 = off\n"
         "\n# Keybinds: one printable character, or space/tab/enter/escape.\n"
         "key_quit = %s\nkey_focus = %s\nkey_down = %s\nkey_up = %s\n"
         "key_top = %s\nkey_bottom = %s\nkey_play_pause = %s\n"
         "key_next = %s\nkey_prev = %s\nkey_seek_back = %s\nkey_seek_forward = %s\n"
         "key_volume_down = %s\nkey_volume_up = %s\nkey_shuffle = %s\n"
-        "key_repeat = %s\nkey_queue = %s\nkey_slow_reverb = %s\n"
-        "key_more_slow_reverb = %s\nkey_fx_reset = %s\nkey_retune = %s\nkey_search = %s\n"
+        "key_repeat = %s\nkey_reverse = %s\nkey_queue = %s\nkey_speed_up = %s\n"
+        "key_speed_down = %s\nkey_bass_boost = %s\nkey_fx_reset = %s\nkey_retune = %s\nkey_search = %s\n"
         "key_devices = %s\nkey_help = %s\nkey_reload = %s\nkey_logout = %s\n"
         "key_client_id = %s\nkey_login = %s\n",
         c->client_id, c->device_name, c->accent, c->dim, c->bitrate,
-        c->speed, c->reverb, c->retune,
+        c->speed, c->reverb, c->bass, c->retune,
         spotc_key_name(c->key_quit, quit, sizeof quit), spotc_key_name(c->key_focus, focus, sizeof focus),
         spotc_key_name(c->key_down, down, sizeof down), spotc_key_name(c->key_up, up, sizeof up),
         spotc_key_name(c->key_top, top, sizeof top), spotc_key_name(c->key_bottom, bottom, sizeof bottom),
@@ -216,8 +248,11 @@ void config_save(const Config *c) {
         spotc_key_name(c->key_prev, prev, sizeof prev), spotc_key_name(c->key_seek_back, back, sizeof back),
         spotc_key_name(c->key_seek_forward, forward, sizeof forward), spotc_key_name(c->key_volume_down, vdown, sizeof vdown),
         spotc_key_name(c->key_volume_up, vup, sizeof vup), spotc_key_name(c->key_shuffle, shuffle, sizeof shuffle),
-        spotc_key_name(c->key_repeat, repeat, sizeof repeat), spotc_key_name(c->key_queue, queue, sizeof queue),
-        spotc_key_name(c->key_slow_reverb, slow, sizeof slow), spotc_key_name(c->key_more_slow_reverb, more_slow, sizeof more_slow),
+        spotc_key_name(c->key_repeat, repeat, sizeof repeat), spotc_key_name(c->key_reverse, reverse, sizeof reverse),
+        spotc_key_name(c->key_queue, queue, sizeof queue),
+        spotc_key_name(c->key_speed_up, speed_up, sizeof speed_up),
+        spotc_key_name(c->key_speed_down, speed_down, sizeof speed_down),
+        spotc_key_name(c->key_bass_boost, bass, sizeof bass),
         spotc_key_name(c->key_fx_reset, reset, sizeof reset), spotc_key_name(c->key_retune, retune, sizeof retune),
         spotc_key_name(c->key_search, search, sizeof search),
         spotc_key_name(c->key_devices, devices, sizeof devices), spotc_key_name(c->key_help, help, sizeof help),

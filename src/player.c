@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <ctype.h>
+#include <errno.h>
 
 static pid_t pids[3];
 static char fifo_path[600];
@@ -55,13 +57,14 @@ static int start_pipeline(App *a, int oauth) {
     unlink(fifo_path);
     if (mkfifo(fifo_path, 0600) != 0) return -1;
 
-    char lrs_cache[700], lrs_log[700], bitrate[16], spd[16], rev[16];
+    char lrs_cache[700], lrs_log[700], bitrate[16], spd[16], rev[16], bass[16];
     snprintf(lrs_cache, sizeof lrs_cache, "%s/librespot", cache_dir());
     mkdir(lrs_cache, 0700);
     snprintf(lrs_log, sizeof lrs_log, "%s/librespot.log", cache_dir());
     snprintf(bitrate, sizeof bitrate, "%d", a->cfg.bitrate);
     snprintf(spd, sizeof spd, "%.3f", a->speed * a->retune);
     snprintf(rev, sizeof rev, "%.3f", a->reverb);
+    snprintf(bass, sizeof bass, "%.3f", a->bass);
 
     int p1[2], p2[2];
     if (pipe(p1) || pipe(p2)) return -1;
@@ -103,8 +106,8 @@ static int start_pipeline(App *a, int oauth) {
         dup2(p2[1], 1);
         close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
         if (logfd >= 0) close(logfd);
-        execl(fx_bin, "spotc-fx", fifo_path, spd, rev, (char *)NULL);
-        execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, (char *)NULL);
+        execl(fx_bin, "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
+        execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
         _exit(127);
     }
 
@@ -132,6 +135,131 @@ static int start_pipeline(App *a, int oauth) {
 
 int player_start(App *a) {
     return start_pipeline(a, 0);
+}
+
+static int valid_track_id(const char *id) {
+    if (!id[0]) return 0;
+    for (const unsigned char *p = (const unsigned char *)id; *p; p++)
+        if (!isalnum(*p)) return 0;
+    return 1;
+}
+
+/* Decode the complete track independently of Spotify Connect.  Since the
+ * helper writes to a regular file, librespot is not paced by an audio device
+ * and normally finishes in a few seconds. */
+int player_cache_reverse(App *a, char *path, size_t n) {
+    if (!valid_track_id(a->now.id) || !a->now.uri[0]) return -1;
+
+    char dir[700], tmp[800], helper[700], lrs_cache[700], logp[700];
+    snprintf(dir, sizeof dir, "%s/reverse", cache_dir());
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
+    snprintf(path, n, "%s/%s-%d.s16", dir, a->now.id, a->cfg.bitrate);
+
+    long long expected = (long long)a->now.duration_ms * 44100 * 4 / 1000;
+    long long tolerance = 5LL * 44100 * 4;
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > 44100 * 4 &&
+        (!expected || (st.st_size >= expected - tolerance &&
+                       st.st_size <= expected + tolerance)))
+        return 0;
+
+    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+    unlink(tmp);
+    snprintf(helper, sizeof helper, "%s/spotc-reverse-cache", self_dir());
+    if (access(helper, X_OK) != 0) snprintf(helper, sizeof helper, "spotc-reverse-cache");
+    snprintf(lrs_cache, sizeof lrs_cache, "%s/librespot", cache_dir());
+    snprintf(logp, sizeof logp, "%s/reverse.log", cache_dir());
+    char bitrate[16];
+    snprintf(bitrate, sizeof bitrate, "%d", a->cfg.bitrate);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int logfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) dup2(devnull, 1);
+        if (logfd >= 0) dup2(logfd, 2);
+        execl(helper, "spotc-reverse-cache", lrs_cache, a->now.uri, tmp,
+              bitrate, (char *)NULL);
+        execlp("spotc-reverse-cache", "spotc-reverse-cache", lrs_cache,
+               a->now.uri, tmp, bitrate, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) return -1;
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        stat(tmp, &st) != 0 || st.st_size < 44100 * 4) {
+        unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 1;
+}
+
+int player_start_reverse(App *a, const char *path) {
+    if (a->pipeline_up) return -1;
+
+    char fx_bin[700], spd[16], rev[16], bass[16], gain[16];
+    snprintf(fx_bin, sizeof fx_bin, "%s/spotc-fx", self_dir());
+    if (access(fx_bin, X_OK) != 0) snprintf(fx_bin, sizeof fx_bin, "spotc-fx");
+    snprintf(spd, sizeof spd, "%.3f", a->speed * a->retune);
+    snprintf(rev, sizeof rev, "%.3f", a->reverb);
+    snprintf(bass, sizeof bass, "%.3f", a->bass);
+    snprintf(gain, sizeof gain, "%.3f", a->volume / 100.0f);
+
+    snprintf(fifo_path, sizeof fifo_path, "%s/fx.ctl", cache_dir());
+    unlink(fifo_path);
+    if (mkfifo(fifo_path, 0600) != 0) return -1;
+
+    int p2[2];
+    if (pipe(p2) != 0) return -1;
+    memset(pids, 0, sizeof pids);
+    pids[1] = fork();
+    if (pids[1] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        dup2(p2[1], 1);
+        close(p2[0]); close(p2[1]);
+        execl(fx_bin, "spotc-fx", fifo_path, spd, rev, bass,
+              "--reverse-file", path, gain, (char *)NULL);
+        execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, bass,
+               "--reverse-file", path, gain, (char *)NULL);
+        _exit(127);
+    }
+    if (pids[1] < 0) { close(p2[0]); close(p2[1]); unlink(fifo_path); return -1; }
+
+    pids[2] = fork();
+    if (pids[2] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        dup2(p2[0], 0);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        close(p2[0]); close(p2[1]);
+        execlp("pacat", "pacat", "--playback", "--raw",
+               "--format=s16le", "--rate=44100", "--channels=2",
+               "--latency-msec=120", "--process-time-msec=20",
+               "--client-name=spotc", "--stream-name=spotc-reverse",
+               (char *)NULL);
+        _exit(127);
+    }
+    if (pids[2] < 0) {
+        kill(pids[1], SIGTERM);
+        waitpid(pids[1], NULL, 0);
+        memset(pids, 0, sizeof pids);
+        close(p2[0]); close(p2[1]); unlink(fifo_path);
+        return -1;
+    }
+    close(p2[0]); close(p2[1]);
+    a->pipeline_up = 1;
+    return 0;
+}
+
+void player_reverse_pause(App *a, int paused) {
+    if (!a->reverse || !a->pipeline_up || pids[1] <= 0) return;
+    kill(pids[1], paused ? SIGSTOP : SIGCONT);
 }
 
 /* relaunch librespot with --enable-oauth: it prints the authorize URL to its
@@ -183,6 +311,10 @@ int player_check(App *a) {
             died = 1;
         }
     if (!died) return 0;
+    /* In whole-track reverse mode the FX reader finishes first.  Let pacat
+     * drain its final buffered samples and close naturally before declaring
+     * the track complete. */
+    if (a->reverse && pids[2] > 0) return 0;
     player_stop(a);
     return 1;
 }
@@ -190,7 +322,10 @@ int player_check(App *a) {
 void player_stop(App *a) {
     if (!a->pipeline_up) return;
     for (int i = 0; i < 3; i++)
-        if (pids[i] > 0) kill(pids[i], SIGTERM);
+        if (pids[i] > 0) {
+            kill(pids[i], SIGCONT); /* a paused reverse worker must be reapable */
+            kill(pids[i], SIGTERM);
+        }
     for (int i = 0; i < 3; i++)
         if (pids[i] > 0) waitpid(pids[i], NULL, 0);
     memset(pids, 0, sizeof pids);
@@ -202,9 +337,11 @@ void player_set_fx(App *a) {
     if (!a->pipeline_up) return;
     int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
     if (fd < 0) return;
-    char msg[64];
-    int n = snprintf(msg, sizeof msg, "speed %.3f\nreverb %.3f\n",
-                     a->speed * a->retune, a->reverb);
+    char msg[128];
+    int n = snprintf(msg, sizeof msg,
+                     "speed %.3f\nreverb %.3f\nbass %.3f\ngain %.3f\n",
+                     a->speed * a->retune, a->reverb, a->bass,
+                     a->reverse ? a->volume / 100.0f : 1.0f);
     ssize_t w = write(fd, msg, n);
     (void)w;
     close(fd);

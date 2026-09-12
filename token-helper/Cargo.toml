@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 librespot-core = "=0.8.0"
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [profile.release]

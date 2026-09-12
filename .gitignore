@@ -1,6 +1,7 @@
 spotc
 spotc-fx
 spotc-ipv4.so
+spotc-reverse-cache
 src/*.o
 .claude-flow/
 token-helper/target/

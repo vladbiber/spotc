@@ -145,10 +145,19 @@ static void draw_bottom(App *a) {
 
     char left[512], right[64], cur[16], tot[16];
     if (a->have_state && a->now.name[0]) {
-        snprintf(left, sizeof left, " %s %s — %s", a->playing ? "▶" : "⏸",
+        const char *icon = !a->playing ? "⏸" : a->reverse ? "◀" : "▶";
+        snprintf(left, sizeof left, " %s %s — %s", icon,
                  a->now.name, a->now.artist);
-        int prog = a->progress_ms;
-        if (a->playing) prog += (int)(now_ms() - a->state_at_ms);
+        int prog;
+        if (a->reverse) {
+            prog = a->reverse_progress_ms;
+            if (a->playing)
+                prog -= (int)((now_ms() - a->state_at_ms) * a->speed * a->retune);
+        } else {
+            prog = a->progress_ms;
+            if (a->playing) prog += (int)(now_ms() - a->state_at_ms);
+        }
+        if (prog < 0) prog = 0;
         if (prog > a->now.duration_ms) prog = a->now.duration_ms;
         ms_to_clock(prog, cur, sizeof cur);
         ms_to_clock(a->now.duration_ms, tot, sizeof tot);
@@ -159,6 +168,8 @@ static void draw_bottom(App *a) {
         int bw = COLS - 2;
         float f = a->now.duration_ms ? (float)prog / a->now.duration_ms : 0;
         int fill = (int)(f * bw);
+        if (fill >= bw) fill = bw - 1;
+        if (fill < 0) fill = 0;
         move(y + 2, 1);
         attron(COLOR_PAIR(CP_ACCENT));
         for (int i = 0; i < fill; i++) addstr("━");
@@ -174,8 +185,8 @@ static void draw_bottom(App *a) {
 
     char fx[256];
     static const char *rep_ind[] = { "", "  ⟳", "  ⟳¹" };
-    /* retune label is the preset's nominal target; the parenthesized value is
-     * where that note actually lands once slow's own pitch drop stacks on top */
+    /* Retune label is the preset's nominal target; the parenthesized value is
+     * where that note lands if a hand-edited config also sets another speed. */
     char tune[48] = "";
     if (a->retune < 0.999f || a->retune > 1.001f) {
         int lbl = 0;
@@ -192,12 +203,15 @@ static void draw_bottom(App *a) {
         else
             snprintf(tune, sizeof tune, "  ·  ret %d Hz", lbl);
     }
-    /* the x shown is the real playback rate: slow and retune multiplied */
+    /* The x shown is the real playback rate: speed and retune multiplied. */
     float rate = a->speed * a->retune;
-    snprintf(fx, sizeof fx, " vol %d%%  ·  %.2fx%s%s  ·  rev %d%%%s%s%s",
-             a->volume, rate, rate < 0.999f ? " slow" : "", tune,
+    const char *speed_state = rate < 0.999f ? " slow" : rate > 1.001f ? " fast" : "";
+    snprintf(fx, sizeof fx, " vol %d%%  ·  %.2fx%s%s  ·  rev %d%%%s%s%s%s%s",
+             a->volume, rate, speed_state, tune,
              (int)(a->reverb * 100),
+             a->bass > 0.001f ? "  ·  bass boost" : "",
              a->shuffle ? "  ⤨" : "", rep_ind[a->repeat],
+             a->reverse ? "  ·  ↶ reverse mode" : "",
              a->pipeline_up ? "" : "  ·  fx need the spotc device");
     putline(y + 3, 0, COLS * 2 / 3, fx, CP_DIM, 0);
     if (a->status[0]) {
@@ -229,7 +243,7 @@ static void draw_popup(App *a) {
     /* help reflects the actual keybinds from ~/.config/spotc/config */
     const Config *c = &a->cfg;
     char pair[8][16];
-    char help[11][96];
+    char help[12][96];
     snprintf(pair[0], sizeof pair[0], "%s/%s", kn(c->key_down), kn(c->key_up));
     snprintf(pair[1], sizeof pair[1], "%s/%s", kn(c->key_next), kn(c->key_prev));
     snprintf(pair[2], sizeof pair[2], "%s/%s", kn(c->key_seek_back), kn(c->key_seek_forward));
@@ -241,15 +255,18 @@ static void draw_popup(App *a) {
     help_line(help[3], sizeof help[3], pair[3], "volume", kn(c->key_queue), "add to queue");
     help_line(help[4], sizeof help[4], kn(c->key_shuffle), "shuffle",
               kn(c->key_repeat), "repeat");
-    help_line(help[5], sizeof help[5], kn(c->key_slow_reverb), "slow+reverb",
-              kn(c->key_more_slow_reverb), "8 gradual levels");
-    help_line(help[6], sizeof help[6], kn(c->key_retune), "retune (432 Hz & co)",
-              kn(c->key_fx_reset), "reset fx");
-    help_line(help[7], sizeof help[7], kn(c->key_search), "search", "", "");
-    snprintf(help[8], sizeof help[8], "%s devices   %s reload   %s logout (clears credentials)",
+    help_line(help[5], sizeof help[5], kn(c->key_reverse), "reverse mode (all tracks)",
+              "", "");
+    help_line(help[6], sizeof help[6], kn(c->key_speed_up), "faster (to 2.0x)",
+              kn(c->key_speed_down), "slower (to 0.5x)");
+    help_line(help[7], sizeof help[7], kn(c->key_bass_boost), "bass boost",
+              kn(c->key_retune), "retune (432 Hz & co)");
+    help_line(help[8], sizeof help[8], kn(c->key_fx_reset), "reset fx",
+              kn(c->key_search), "search");
+    snprintf(help[9], sizeof help[9], "%s devices   %s reload   %s logout (clears credentials)",
              kn(c->key_devices), kn(c->key_reload), kn(c->key_logout));
-    snprintf(help[9], sizeof help[9], "change all keys: ~/.config/spotc/config");
-    help_line(help[10], sizeof help[10], kn(c->key_quit), "quit", "", "");
+    snprintf(help[10], sizeof help[10], "change all keys: ~/.config/spotc/config");
+    help_line(help[11], sizeof help[11], kn(c->key_quit), "quit", "", "");
 
     int w, h;
     const char *title;
@@ -313,9 +330,9 @@ static void draw_popup(App *a) {
         putline(fy + 1, x0 + 3, w - 6,
                 "the nearest note is tuned to hit the target Hz; no claim has", CP_DIM, 0);
         putline(fy + 2, x0 + 3, w - 6,
-                "scientific evidence. slow+reverb would drag the pitch off the", CP_DIM, 0);
+                "scientific evidence. changing playback speed shifts the pitch,", CP_DIM, 0);
         putline(fy + 3, x0 + 3, w - 6,
-                "target, so picking one turns the other off (and vice versa).", CP_DIM, 0);
+                "so choosing a preset returns playback speed to 1.0x.", CP_DIM, 0);
     } else {
         if (a->n_devices == 0)
             putline(y0 + 2, x0 + 3, w - 6, "no devices found", CP_DIM, 0);
@@ -342,7 +359,7 @@ static void draw_login(App *a) {
     putline(y + 6, 7, COLS - 11, "check 'Web API'  ·  Save  ·  copy the Client ID", CP_TEXT, 0);
     putline(y + 7, 4, COLS - 8, "2  press  i  and paste the Client ID", CP_TEXT, A_BOLD);
     putline(y + 8, 4, COLS - 8, "3  press  l  and sign in in your browser", CP_TEXT, A_BOLD);
-    putline(y + 10, 4, COLS - 8, "sound on this PC + slow/reverb:  Spotify on your phone"
+    putline(y + 10, 4, COLS - 8, "sound on this PC + local effects:  Spotify on your phone"
             "  →  Devices  →  'spotc'", CP_DIM, 0);
     putline(y + 12, 4, COLS - 8, "Spotify Premium required  ·  q quit", CP_DIM, 0);
     if (a->status[0]) putline(y + 14, 4, COLS - 8, a->status, CP_ACCENT, A_BOLD);

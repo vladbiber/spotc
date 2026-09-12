@@ -11,6 +11,228 @@ static int pipeline_start(App *a) {
     return rc;
 }
 
+static int reverse_position(App *a) {
+    int pos = a->reverse_progress_ms;
+    if (a->reverse && a->playing) {
+        float rate = a->speed * a->retune;
+        pos -= (int)((now_ms() - a->state_at_ms) * rate);
+    }
+    return pos > 0 ? pos : 0;
+}
+
+static void latch_reverse_position(App *a) {
+    if (!a->reverse) return;
+    a->reverse_progress_ms = reverse_position(a);
+    a->state_at_ms = now_ms();
+}
+
+static int wait_local_device(App *a, char *id, size_t n) {
+    for (int tries = 0; tries < 20; tries++) {
+        if (api_fetch_devices(a) == 0) {
+            for (int i = 0; i < a->n_devices; i++) {
+                if (!strcmp(a->devices[i].name, a->cfg.device_name)) {
+                    snprintf(id, n, "%s", a->devices[i].id);
+                    return 0;
+                }
+            }
+        }
+        struct timespec ts = { 0, 250 * 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+static void clear_reverse_queue(App *a) {
+    free(a->reverse_tracks);
+    a->reverse_tracks = NULL;
+    a->n_reverse_tracks = 0;
+    a->reverse_index = -1;
+}
+
+/* Freeze the current list when reverse mode starts. Browsing another album or
+ * playlist must not silently replace the sequence that is already playing. */
+static void capture_reverse_queue(App *a, int selected) {
+    clear_reverse_queue(a);
+    if (selected < 0 || selected >= a->n_tracks ||
+        a->tracks[selected].is_album || strcmp(a->tracks[selected].id, a->now.id)) {
+        selected = -1;
+        for (int i = 0; i < a->n_tracks; i++)
+            if (!a->tracks[i].is_album && !strcmp(a->tracks[i].id, a->now.id)) {
+                selected = i;
+                break;
+            }
+    }
+    if (selected >= 0) {
+        a->reverse_tracks = malloc((size_t)a->n_tracks * sizeof *a->reverse_tracks);
+        if (a->reverse_tracks) {
+            memcpy(a->reverse_tracks, a->tracks,
+                   (size_t)a->n_tracks * sizeof *a->reverse_tracks);
+            a->n_reverse_tracks = a->n_tracks;
+            a->reverse_index = selected;
+            return;
+        }
+    }
+    /* A track started outside the list still gets exact reverse; there simply
+     * is no reliable local next item after it. */
+    a->reverse_tracks = malloc(sizeof *a->reverse_tracks);
+    if (a->reverse_tracks) {
+        a->reverse_tracks[0] = a->now;
+        a->n_reverse_tracks = 1;
+        a->reverse_index = 0;
+    }
+}
+
+static void leave_reverse(App *a, int target, int play) {
+    player_stop(a);
+    a->reverse = 0;
+    clear_reverse_queue(a);
+    a->playing = 0;
+    a->progress_ms = target;
+    a->state_at_ms = now_ms();
+    if (pipeline_start(a) != 0) {
+        set_status(a, "reverse stopped — librespot could not restart");
+        return;
+    }
+
+    set_status(a, "returning to normal playback...");
+    ui_draw(a);
+    char dev[128];
+    if (wait_local_device(a, dev, sizeof dev) != 0 ||
+        api_play_uri_at(a, a->now.uri, target, dev) != 0) {
+        set_status(a, "reverse stopped — pick the spotc device again (d)");
+        return;
+    }
+    if (!play) api_pause(a);
+    a->playing = play;
+    a->progress_ms = target;
+    a->state_at_ms = now_ms();
+    snprintf(a->active_device, sizeof a->active_device, "%s", a->cfg.device_name);
+    set_status(a, play ? "reverse off — normal playback resumed"
+                       : "reverse off — normal playback paused");
+    a->last_poll_ms = now_ms();
+}
+
+/* Decode and play a->now from its final PCM frame to its first.  Once reverse
+ * is enabled this same path is reused for every selected/adjacent track. */
+static int launch_reverse_current(App *a) {
+    if (!a->now.uri[0] || !a->now.duration_ms) {
+        set_status(a, "this track cannot be played in reverse");
+        return -1;
+    }
+    a->playing = 0;
+    a->reverse_progress_ms = a->now.duration_ms;
+    a->state_at_ms = now_ms();
+    set_status(a, "reverse mode: preparing %s...", a->now.name);
+    ui_draw(a);
+    char path[800];
+    int cached = player_cache_reverse(a, path, sizeof path);
+    if (cached < 0) {
+        set_status(a, "reverse preparation failed — see ~/.cache/spotc/reverse.log");
+        return -1;
+    }
+
+    player_stop(a);
+    a->reverse = 1;
+    a->reverse_progress_ms = a->now.duration_ms;
+    a->state_at_ms = now_ms();
+    a->playing = 1;
+    if (player_start_reverse(a, path) != 0) {
+        a->playing = 0;
+        set_status(a, "reverse could not start — press R to return to normal");
+        return -1;
+    }
+    set_status(a, cached == 0 ? "reverse mode: end → beginning (from cache)"
+                              : "reverse mode: end → beginning");
+    return 0;
+}
+
+static void start_reverse(App *a) {
+    if (!a->have_state || !a->now.uri[0] || !a->now.duration_ms) {
+        set_status(a, "start a track before using reverse");
+        return;
+    }
+    if (strcmp(a->active_device, a->cfg.device_name)) {
+        set_status(a, "reverse only works on the local '%s' device (d)", a->cfg.device_name);
+        return;
+    }
+
+    int was_playing = a->playing;
+    int forward_pos = a->progress_ms;
+    if (was_playing) forward_pos += (int)(now_ms() - a->state_at_ms);
+    if (was_playing && api_pause(a) != 0) return;
+    a->playing = 0;
+    a->progress_ms = forward_pos;
+    a->reverse_was_playing = was_playing;
+    capture_reverse_queue(a, -1);
+
+    if (launch_reverse_current(a) == 0) return;
+    if (!a->reverse) {
+        clear_reverse_queue(a);
+        if (was_playing && api_resume(a) == 0) {
+            a->playing = 1;
+            a->state_at_ms = now_ms();
+        }
+        return;
+    }
+    a->reverse_progress_ms = forward_pos;
+    leave_reverse(a, forward_pos, was_playing);
+}
+
+static int reverse_track_index(const App *a) {
+    if (a->reverse_index >= 0 && a->reverse_index < a->n_reverse_tracks &&
+        !strcmp(a->reverse_tracks[a->reverse_index].id, a->now.id))
+        return a->reverse_index;
+    for (int i = 0; i < a->n_reverse_tracks; i++)
+        if (!a->reverse_tracks[i].is_album &&
+            !strcmp(a->reverse_tracks[i].id, a->now.id)) return i;
+    return -1;
+}
+
+static int adjacent_reverse_track(const App *a, int direction, int automatic) {
+    int current = reverse_track_index(a);
+    if (current < 0) return -1;
+    if (automatic && a->repeat == 2) return current;
+
+    for (int i = current + direction;; i += direction) {
+        if (i < 0 || i >= a->n_reverse_tracks) {
+            if (a->repeat != 1) return -1;
+            i = direction > 0 ? 0 : a->n_reverse_tracks - 1;
+        }
+        if (i == current) return automatic && a->repeat == 1 ? current : -1;
+        if (!a->reverse_tracks[i].is_album && a->reverse_tracks[i].uri[0] &&
+            a->reverse_tracks[i].duration_ms > 0) return i;
+    }
+}
+
+static void change_reverse_track(App *a, int direction, int automatic) {
+    int next = adjacent_reverse_track(a, direction, automatic);
+    if (next < 0) {
+        if (automatic) {
+            player_stop(a);
+            a->playing = 0;
+            a->reverse_progress_ms = direction > 0 ? 0 : a->now.duration_ms;
+            a->state_at_ms = now_ms();
+        }
+        set_status(a, automatic ? "reverse mode: end of list — select a track or press R"
+                                : "no more tracks in this direction");
+        return;
+    }
+    player_stop(a);
+    a->playing = 0;
+    a->reverse_index = next;
+    a->now = a->reverse_tracks[next];
+    for (int i = 0; i < a->n_tracks; i++)
+        if (!a->tracks[i].is_album && !strcmp(a->tracks[i].id, a->now.id)) {
+            a->tr_sel = i;
+            break;
+        }
+    a->have_state = 1;
+    a->progress_ms = 0;
+    a->reverse_progress_ms = a->now.duration_ms;
+    a->state_at_ms = now_ms();
+    launch_reverse_current(a);
+}
+
 /* librespot/fx/pacat exited: restart once it ran long enough that this
  * isn't a crash loop, otherwise leave it down and point at the log */
 static void pipeline_died(App *a) {
@@ -18,7 +240,7 @@ static void pipeline_died(App *a) {
         set_status(a, "audio pipeline restarted");
         return;
     }
-    set_status(a, "librespot exited — see ~/.cache/spotc/librespot.log, R retries");
+    set_status(a, "librespot exited — see ~/.cache/spotc/librespot.log; reload retries");
 }
 
 static void open_sidebar_sel(App *a) {
@@ -45,6 +267,18 @@ static void play_selected(App *a) {
         set_status(a, "loading...");
         ui_draw(a);
         if (!api_load_album_tracks(a, &alb)) set_status(a, "");
+        return;
+    }
+    if (a->reverse) {
+        player_stop(a);
+        a->tr_sel = (int)(t - a->tracks);
+        a->now = *t;
+        capture_reverse_queue(a, a->tr_sel);
+        a->have_state = 1;
+        a->progress_ms = 0;
+        a->reverse_progress_ms = t->duration_ms;
+        a->state_at_ms = now_ms();
+        launch_reverse_current(a);
         return;
     }
     /* no active device? play straight on the local spotc device */
@@ -82,22 +316,26 @@ static void do_search(App *a) {
     }
 }
 
-static void set_fx(App *a, float speed, float reverb) {
+static void set_fx(App *a, float speed, float reverb, float bass) {
+    latch_reverse_position(a);
     a->speed = speed;
     a->reverb = reverb;
+    a->bass = bass;
     player_set_fx(a);
     a->cfg.speed = a->speed;
     a->cfg.reverb = a->reverb;
+    a->cfg.bass = a->bass;
     config_save(&a->cfg);
-    if (!a->pipeline_up || strcmp(a->active_device, a->cfg.device_name))
-        set_status(a, "slow/reverb apply when playing on '%s' (d)", a->cfg.device_name);
+    if (!a->pipeline_up || (!a->reverse && strcmp(a->active_device, a->cfg.device_name)))
+        set_status(a, "local effects apply when playing on '%s' (d)", a->cfg.device_name);
 }
 
 static void set_retune(App *a, int preset) {
     const RetunePreset *p = &retune_presets[preset];
-    /* retune and slow+reverb are exclusive: stacked they would drag the
-     * pitch off the advertised Hz, and the whole point is hitting it */
-    int had_fx = a->speed < 0.999f || a->reverb > 0.001f;
+    latch_reverse_position(a);
+    /* A speed change shifts pitch, so a named retune preset always returns
+     * playback to 1.0x. Bass remains independent. */
+    int had_speed = a->speed < 0.999f || a->speed > 1.001f;
     a->retune = p->ratio;
     a->cfg.retune = a->retune;
     if (preset != 0) {
@@ -119,55 +357,56 @@ static void set_retune(App *a, int preset) {
                    p->note, p->hz, a->retune, (int)(p->reverb * 100));
     else
         set_status(a, "retune %s = %d Hz (%.3fx)%s", p->note, p->hz, a->retune,
-                   had_fx ? "  ·  slow+reverb off" : "");
+                   had_speed ? "  ·  speed reset to 1.0x" : "");
 }
 
 static int key_is(int ch, int configured) {
     return configured > 0 && ch == configured;
 }
 
-static void slow_reverb(App *a, int stronger) {
-    static const float speeds[] = { 1.00f, 0.92f, 0.86f, 0.80f, 0.74f,
-                                    0.68f, 0.62f, 0.56f, 0.50f };
-    static const float reverbs[] = { 0.00f, 0.10f, 0.18f, 0.26f, 0.34f,
-                                     0.42f, 0.50f, 0.58f, 0.65f };
-    enum { FX_LEVELS = (int)(sizeof speeds / sizeof *speeds) - 1 };
-    /* clear retune even when toggling off: a deep preset's slowdown must not
-     * survive an "o" press that reads as "turn the effects off" */
+static void step_speed(App *a, int direction) {
+    static const float speeds[] = {
+        0.50f, 0.60f, 0.70f, 0.80f, 0.90f, 1.00f,
+        1.10f, 1.20f, 1.35f, 1.50f, 1.75f, 2.00f
+    };
+    enum { SPEEDS = (int)(sizeof speeds / sizeof *speeds) };
+    latch_reverse_position(a);
     int had_retune = a->retune < 0.999f || a->retune > 1.001f;
-    int level = 0;
-    if (!had_retune) {
-        /* a deep preset's reverb is not a slow level: matching it against the
-         * ladder would make the first "p" jump straight to 0.80x */
-        float nearest = 1000.0f;
-        for (int i = 0; i <= FX_LEVELS; i++) {
-            float d = (a->speed - speeds[i]) * (a->speed - speeds[i]) +
-                      (a->reverb - reverbs[i]) * (a->reverb - reverbs[i]);
-            if (d < nearest) { nearest = d; level = i; }
-        }
-    }
-    if (!stronger) level = level ? 0 : 1;
-    else if (level < FX_LEVELS) level++;
     if (had_retune) {
         a->retune = 1.0f;
         a->cfg.retune = 1.0f;
     }
-    set_fx(a, speeds[level], reverbs[level]);
-    if (a->pipeline_up && !strcmp(a->active_device, a->cfg.device_name)) {
-        if (level)
-            set_status(a, "slow + reverb %d/%d  %.2fx  rev %d%%%s",
-                       level, FX_LEVELS, speeds[level], (int)(reverbs[level] * 100),
-                       had_retune ? "  ·  retune off" : "");
-        else
-            set_status(a, "slow + reverb off%s",
-                       had_retune ? "  ·  retune off" : "");
+
+    float target = a->speed;
+    if (direction > 0) {
+        for (int i = 0; i < SPEEDS; i++)
+            if (speeds[i] > a->speed + 0.005f) { target = speeds[i]; break; }
+    } else {
+        for (int i = SPEEDS - 1; i >= 0; i--)
+            if (speeds[i] < a->speed - 0.005f) { target = speeds[i]; break; }
     }
+    set_fx(a, target, a->reverb, a->bass);
+    if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name))) {
+        const char *limit = direction > 0 && target >= 1.999f ? " (maximum)" :
+                            direction < 0 && target <= 0.501f ? " (minimum)" : "";
+        set_status(a, "speed %.2fx%s%s", target, limit,
+                   had_retune ? "  ·  retune off" : "");
+    }
+}
+
+static void toggle_bass(App *a) {
+    float bass = a->bass > 0.001f ? 0.0f : 1.0f;
+    set_fx(a, a->speed, a->reverb, bass);
+    if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name)))
+        set_status(a, bass > 0.0f ? "bass boost on" : "bass boost off");
 }
 
 static void logout(App *a) {
     player_stop(a);
+    clear_reverse_queue(a);
     auth_logout(a);
     a->have_state = a->playing = 0;
+    a->reverse = 0;
     a->active_device[0] = 0;
     a->screen = SCREEN_LOGIN;
     if (pipeline_start(a) != 0)
@@ -181,6 +420,12 @@ static void request_volume(App *a, int delta) {
     int target = base + delta;
     if (target < 0) target = 0;
     if (target > 100) target = 100;
+    if (a->reverse) {
+        a->volume = target;
+        a->volume_target = -1;
+        player_set_fx(a);
+        return;
+    }
     a->volume = target;              /* never let a stale poll move the UI */
     a->volume_target = target;
     a->volume_send_at_ms = now_ms() + 140;  /* coalesce rapid +/- input */
@@ -203,6 +448,10 @@ static void flush_volume(App *a) {
 
 static void seek_rel(App *a, int delta_ms) {
     if (!a->have_state || !a->now.duration_ms) return;
+    if (a->reverse) {
+        set_status(a, "seek is unavailable during exact reverse; R returns to normal");
+        return;
+    }
     int prog = a->progress_ms;
     if (a->playing) prog += (int)(now_ms() - a->state_at_ms);
     int target = prog + delta_ms;
@@ -268,16 +517,33 @@ static void handle_key(App *a, int ch) {
         if (a->focus == FOCUS_TRACKS && a->n_tracks) a->tr_sel = a->n_tracks - 1;
         else a->pl_sel = sidebar_total(a) - 1;
     } else if (key_is(ch, a->cfg.key_play_pause)) {
-        if (a->playing) { if (!api_pause(a)) { a->playing = 0;
+        if (a->reverse) {
+            if (!a->pipeline_up) {
+                launch_reverse_current(a);
+            } else {
+                latch_reverse_position(a);
+                a->playing = !a->playing;
+                player_reverse_pause(a, !a->playing);
+                a->state_at_ms = now_ms();
+            }
+        } else if (a->playing) { if (!api_pause(a)) { a->playing = 0;
             a->progress_ms += (int)(now_ms() - a->state_at_ms); } }
         else if (!api_resume(a)) { a->playing = 1; a->state_at_ms = now_ms(); }
     } else if (ch == '\n' || ch == KEY_ENTER) {
         if (a->focus == FOCUS_SIDEBAR) open_sidebar_sel(a);
         else play_selected(a);
     } else if (key_is(ch, a->cfg.key_next)) {
-        if (!api_next(a)) a->last_poll_ms = now_ms() - 1500;
+        if (a->reverse) {
+            change_reverse_track(a, +1, 0);
+        } else if (!api_next(a)) {
+            a->last_poll_ms = now_ms() - 1500;
+        }
     } else if (key_is(ch, a->cfg.key_prev)) {
-        if (!api_prev(a)) a->last_poll_ms = now_ms() - 1500;
+        if (a->reverse) {
+            change_reverse_track(a, -1, 0);
+        } else if (!api_prev(a)) {
+            a->last_poll_ms = now_ms() - 1500;
+        }
     } else if (key_is(ch, a->cfg.key_seek_back)) {
         seek_rel(a, -10000);
     } else if (key_is(ch, a->cfg.key_seek_forward)) {
@@ -290,19 +556,29 @@ static void handle_key(App *a, int ch) {
         if (!api_set_shuffle(a, !a->shuffle)) a->shuffle = !a->shuffle;
     } else if (key_is(ch, a->cfg.key_repeat)) {
         if (!api_set_repeat(a, (a->repeat + 1) % 3)) a->repeat = (a->repeat + 1) % 3;
+    } else if (key_is(ch, a->cfg.key_reverse)) {
+        if (a->reverse)
+            leave_reverse(a, reverse_position(a), a->reverse_was_playing);
+        else
+            start_reverse(a);
     } else if (key_is(ch, a->cfg.key_queue)) {
         if (a->focus == FOCUS_TRACKS && a->tr_sel < a->n_tracks) {
             if (!api_queue_add(a, a->tracks[a->tr_sel].uri))
                 set_status(a, "queued: %s", a->tracks[a->tr_sel].name);
         }
-    } else if (key_is(ch, a->cfg.key_slow_reverb)) {
-        slow_reverb(a, 0);
-    } else if (key_is(ch, a->cfg.key_more_slow_reverb)) {
-        slow_reverb(a, 1);
+    } else if (key_is(ch, a->cfg.key_speed_up)) {
+        step_speed(a, +1);
+    } else if (key_is(ch, a->cfg.key_speed_down)) {
+        step_speed(a, -1);
+    } else if (key_is(ch, a->cfg.key_bass_boost)) {
+        toggle_bass(a);
     } else if (key_is(ch, a->cfg.key_fx_reset)) {
+        latch_reverse_position(a);
         a->retune = 1.0f;
         a->cfg.retune = 1.0f;
-        set_fx(a, 1.0f, 0.0f);
+        set_fx(a, 1.0f, 0.0f, 0.0f);
+        if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name)))
+            set_status(a, "local effects reset");
     } else if (key_is(ch, a->cfg.key_retune)) {
         a->popup = POPUP_RETUNE;
     } else if (key_is(ch, a->cfg.key_search)) {
@@ -341,6 +617,7 @@ int main(void) {
     config_load(&a.cfg);
     a.speed = a.cfg.speed;
     a.reverb = a.cfg.reverb;
+    a.bass = a.cfg.bass;
     a.retune = a.cfg.retune;
     signal(SIGPIPE, SIG_IGN);
 
@@ -387,15 +664,19 @@ int main(void) {
 
         if (ch != ERR) handle_key(&a, ch);
 
-        if (player_check(&a)) pipeline_died(&a);
+        if (player_check(&a)) {
+            if (a.reverse) change_reverse_track(&a, +1, 1);
+            else pipeline_died(&a);
+        }
         flush_volume(&a);
 
-        if (now_ms() - a.last_poll_ms > 2500)
+        if (!a.reverse && now_ms() - a.last_poll_ms > 2500)
             api_fetch_state(&a);
     }
 
     ui_shutdown();
     player_stop(&a);
+    clear_reverse_queue(&a);
     curl_global_cleanup();
     return 0;
 }
