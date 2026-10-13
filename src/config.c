@@ -44,7 +44,8 @@ static void default_keys(Config *c) {
     c->key_repeat = 'r';           c->key_reverse = 'R';
     c->key_queue = 'a';
     c->key_speed_up = 'o';         c->key_speed_down = 'p';
-    c->key_bass_boost = 'B';
+    c->key_bass_boost = 'B';       c->key_vinyl = 'v';
+    c->key_rain = 'w';
     c->key_fx_reset = '0';         c->key_retune = 'h';
     c->key_search = '/';
     c->key_devices = 'd';          c->key_help = '?';
@@ -147,6 +148,9 @@ void config_load(Config *c) {
         else if (!strcmp(key, "reverb")) c->reverb = strtof(val, NULL);
         else if (!strcmp(key, "bass")) c->bass = strtof(val, NULL);
         else if (!strcmp(key, "retune")) c->retune = strtof(val, NULL);
+        else if (!strcmp(key, "vinyl")) c->vinyl = atoi(val);
+        else if (!strcmp(key, "rain")) c->rain = atoi(val);
+        else if (!strcmp(key, "music_dir")) snprintf(c->music_dir, sizeof c->music_dir, "%s", val);
         else {
             read_key(key, val, "key_quit", &c->key_quit);
             read_key(key, val, "key_focus", &c->key_focus);
@@ -181,6 +185,8 @@ void config_load(Config *c) {
                 read_key(key, val, "key_more_slow_reverb", &legacy_speed_down);
             }
             read_key(key, val, "key_bass_boost", &c->key_bass_boost);
+            read_key(key, val, "key_vinyl", &c->key_vinyl);
+            read_key(key, val, "key_rain", &c->key_rain);
             read_key(key, val, "key_fx_reset", &c->key_fx_reset);
             read_key(key, val, "key_retune", &c->key_retune);
             read_key(key, val, "key_search", &c->key_search);
@@ -207,6 +213,9 @@ void config_load(Config *c) {
     if (c->reverb < 0.0f || c->reverb > 1.0f) c->reverb = 0.0f;
     if (c->bass < 0.0f || c->bass > 1.0f) c->bass = 0.0f;
     if (c->retune < 0.8f || c->retune > 1.3f) c->retune = 1.0f;
+    if (c->vinyl < 0 || c->vinyl > 4) c->vinyl = 0;
+    if (c->rain < 0 || c->rain > 3) c->rain = 0;
+    if (!c->music_dir[0]) snprintf(c->music_dir, sizeof c->music_dir, "~/Music");
 }
 
 void config_save(const Config *c) {
@@ -217,7 +226,7 @@ void config_save(const Config *c) {
     char quit[8], focus[8], down[8], up[8], top[8], bottom[8], play[8];
     char next[8], prev[8], back[8], forward[8], vdown[8], vup[8], shuffle[8];
     char repeat[8], reverse[8], queue[8], speed_up[8], speed_down[8], bass[8];
-    char reset[8], retune[8], search[8];
+    char reset[8], retune[8], search[8], vinyl[8], rain[8];
     char devices[8], help[8], reload[8], logout[8], client_id[8], login[8];
     fprintf(f,
         "# spotc config\n"
@@ -230,17 +239,20 @@ void config_save(const Config *c) {
         "reverb = %.2f        # 0.00 - 1.00\n"
         "bass = %.2f          # 0.00 = off, 1.00 = bass boost\n"
         "retune = %.4f       # tuning ratio vs A4=440 (0.9818 = 432 Hz), 1.0 = off\n"
+        "vinyl = %d           # record sound: 0 off, 1 mint, 2 played, 3 dusty, 4 lo-fi\n"
+        "rain = %d            # rain sounds: 0 off, 1 drizzle, 2 rain, 3 storm\n"
+        "music_dir = %s     # local files shown under \"Local files\"\n"
         "\n# Keybinds: one printable character, or space/tab/enter/escape.\n"
         "key_quit = %s\nkey_focus = %s\nkey_down = %s\nkey_up = %s\n"
         "key_top = %s\nkey_bottom = %s\nkey_play_pause = %s\n"
         "key_next = %s\nkey_prev = %s\nkey_seek_back = %s\nkey_seek_forward = %s\n"
         "key_volume_down = %s\nkey_volume_up = %s\nkey_shuffle = %s\n"
         "key_repeat = %s\nkey_reverse = %s\nkey_queue = %s\nkey_speed_up = %s\n"
-        "key_speed_down = %s\nkey_bass_boost = %s\nkey_fx_reset = %s\nkey_retune = %s\nkey_search = %s\n"
+        "key_speed_down = %s\nkey_bass_boost = %s\nkey_vinyl = %s\nkey_rain = %s\nkey_fx_reset = %s\nkey_retune = %s\nkey_search = %s\n"
         "key_devices = %s\nkey_help = %s\nkey_reload = %s\nkey_logout = %s\n"
         "key_client_id = %s\nkey_login = %s\n",
         c->client_id, c->device_name, c->accent, c->dim, c->bitrate,
-        c->speed, c->reverb, c->bass, c->retune,
+        c->speed, c->reverb, c->bass, c->retune, c->vinyl, c->rain, c->music_dir,
         spotc_key_name(c->key_quit, quit, sizeof quit), spotc_key_name(c->key_focus, focus, sizeof focus),
         spotc_key_name(c->key_down, down, sizeof down), spotc_key_name(c->key_up, up, sizeof up),
         spotc_key_name(c->key_top, top, sizeof top), spotc_key_name(c->key_bottom, bottom, sizeof bottom),
@@ -253,6 +265,8 @@ void config_save(const Config *c) {
         spotc_key_name(c->key_speed_up, speed_up, sizeof speed_up),
         spotc_key_name(c->key_speed_down, speed_down, sizeof speed_down),
         spotc_key_name(c->key_bass_boost, bass, sizeof bass),
+        spotc_key_name(c->key_vinyl, vinyl, sizeof vinyl),
+        spotc_key_name(c->key_rain, rain, sizeof rain),
         spotc_key_name(c->key_fx_reset, reset, sizeof reset), spotc_key_name(c->key_retune, retune, sizeof retune),
         spotc_key_name(c->key_search, search, sizeof search),
         spotc_key_name(c->key_devices, devices, sizeof devices), spotc_key_name(c->key_help, help, sizeof help),

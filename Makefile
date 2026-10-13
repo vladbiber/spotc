@@ -4,7 +4,7 @@ CFLAGS  += -O2 -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE $(shell pkg-config --cfl
 LDLIBS   = $(shell pkg-config --libs $(PKGS))
 PREFIX  ?= $(HOME)/.local
 
-OBJ = src/main.o src/ui.o src/api.o src/auth.o src/player.o src/config.o
+OBJ = src/main.o src/ui.o src/api.o src/auth.o src/player.o src/config.o src/local.o
 
 all: spotc spotc-fx spotc-ipv4.so spotc-reverse-cache
 
@@ -13,7 +13,7 @@ spotc: $(OBJ)
 
 $(OBJ): src/spotc.h
 
-spotc-fx: src/fx.c
+spotc-fx: src/fx.c src/vinyl.h src/rain.h
 	$(CC) $(CFLAGS) -o $@ src/fx.c -lm
 
 spotc-ipv4.so: src/ipv4.c

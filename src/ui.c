@@ -79,9 +79,10 @@ static void hline_str(int y, int x, int w, const char *ch, int cp) {
 }
 
 static void sidebar_entry(App *a, int idx, char *out, size_t n) {
-    if (idx == 0) snprintf(out, n, "♥ Liked Songs");
-    else if (idx <= a->n_albums) snprintf(out, n, "⊚ %s", a->albums[idx - 1].name);
-    else snprintf(out, n, "≡ %s", a->playlists[idx - 1 - a->n_albums].name);
+    if (idx == 0) snprintf(out, n, "♫ Local files");
+    else if (idx == 1) snprintf(out, n, "♥ Liked Songs");
+    else if (idx <= 1 + a->n_albums) snprintf(out, n, "⊚ %s", a->albums[idx - 2].name);
+    else snprintf(out, n, "≡ %s", a->playlists[idx - 2 - a->n_albums].name);
 }
 
 static void draw_sidebar(App *a, int w, int h) {
@@ -155,7 +156,8 @@ static void draw_bottom(App *a) {
                 prog -= (int)((now_ms() - a->state_at_ms) * a->speed * a->retune);
         } else {
             prog = a->progress_ms;
-            if (a->playing) prog += (int)(now_ms() - a->state_at_ms);
+            float rate = a->local ? a->speed * a->retune : 1.0f;
+            if (a->playing) prog += (int)((now_ms() - a->state_at_ms) * rate);
         }
         if (prog < 0) prog = 0;
         if (prog > a->now.duration_ms) prog = a->now.duration_ms;
@@ -206,13 +208,18 @@ static void draw_bottom(App *a) {
     /* The x shown is the real playback rate: speed and retune multiplied. */
     float rate = a->speed * a->retune;
     const char *speed_state = rate < 0.999f ? " slow" : rate > 1.001f ? " fast" : "";
-    snprintf(fx, sizeof fx, " vol %d%%  ·  %.2fx%s%s  ·  rev %d%%%s%s%s%s%s",
+    static const char *const vinyl_ind[] = { "", "  ·  vinyl mint", "  ·  vinyl played",
+                                             "  ·  vinyl dusty", "  ·  vinyl lo-fi" };
+    static const char *const rain_ind[] = { "", "  ·  drizzle", "  ·  rain", "  ·  storm" };
+    snprintf(fx, sizeof fx, " vol %d%%  ·  %.2fx%s%s  ·  rev %d%%%s%s%s%s%s%s%s",
              a->volume, rate, speed_state, tune,
              (int)(a->reverb * 100),
              a->bass > 0.001f ? "  ·  bass boost" : "",
+             vinyl_ind[a->vinyl >= 0 && a->vinyl < 5 ? a->vinyl : 0],
+             rain_ind[a->rain >= 0 && a->rain < 4 ? a->rain : 0],
              a->shuffle ? "  ⤨" : "", rep_ind[a->repeat],
-             a->reverse ? "  ·  ↶ reverse mode" : "",
-             a->pipeline_up ? "" : "  ·  fx need the spotc device");
+             a->reverse ? "  ·  ↶ reverse mode" : a->local ? "  ·  local file" : "",
+             a->pipeline_up || a->local ? "" : "  ·  fx need the spotc device");
     putline(y + 3, 0, COLS * 2 / 3, fx, CP_DIM, 0);
     if (a->status[0]) {
         int sw = COLS / 3 - 1;
@@ -256,7 +263,7 @@ static void draw_popup(App *a) {
     help_line(help[4], sizeof help[4], kn(c->key_shuffle), "shuffle",
               kn(c->key_repeat), "repeat");
     help_line(help[5], sizeof help[5], kn(c->key_reverse), "reverse mode (all tracks)",
-              "", "");
+              kn(c->key_vinyl), "vinyl sound (cycle)");
     help_line(help[6], sizeof help[6], kn(c->key_speed_up), "faster (to 2.0x)",
               kn(c->key_speed_down), "slower (to 0.5x)");
     help_line(help[7], sizeof help[7], kn(c->key_bass_boost), "bass boost",
@@ -266,7 +273,8 @@ static void draw_popup(App *a) {
     snprintf(help[9], sizeof help[9], "%s devices   %s reload   %s logout (clears credentials)",
              kn(c->key_devices), kn(c->key_reload), kn(c->key_logout));
     snprintf(help[10], sizeof help[10], "change all keys: ~/.config/spotc/config");
-    help_line(help[11], sizeof help[11], kn(c->key_quit), "quit", "", "");
+    help_line(help[11], sizeof help[11], kn(c->key_quit), "quit",
+              kn(c->key_rain), "rain sounds (cycle)");
 
     int w, h;
     const char *title;

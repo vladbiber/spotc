@@ -2,13 +2,17 @@
  * usage: spotc-fx <control-fifo> [speed] [reverb] [bass]
  *        spotc-fx <control-fifo> [speed] [reverb] [bass]
  *                 --reverse-file <raw> [gain]
- * fifo commands: "speed 1.2" / "reverb 0.4" / "bass 1" / "gain 0.8" */
+ * fifo commands: "speed 1.2" / "reverb 0.4" / "bass 1" / "gain 0.8" / "vinyl 2"
+ *                / "rain 2"
+ * SPOTC_FX_VINYL / SPOTC_FX_RAIN in the environment set the starting presets */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "vinyl.h"
+#include "rain.h"
 
 #define CHUNK 2048          /* frames per read */
 #define NCOMB 8
@@ -75,6 +79,7 @@ static float hermite(float xm1, float x0, float x1, float x2, float t) {
 
 static volatile float g_speed = 1.0f, g_reverb = 0.0f;
 static volatile float g_bass = 0.0f, g_gain = 1.0f;
+static volatile int g_vinyl = 0, g_rain = 0;
 
 static float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -99,6 +104,8 @@ static void poll_fifo(int fd) {
         else if (sscanf(acc, "reverb %f", &val) == 1 && val >= 0.0f && val <= 1.0f) g_reverb = val;
         else if (sscanf(acc, "bass %f", &val) == 1 && val >= 0.0f && val <= 1.0f) g_bass = val;
         else if (sscanf(acc, "gain %f", &val) == 1 && val >= 0.0f && val <= 1.0f) g_gain = val;
+        else if (sscanf(acc, "vinyl %f", &val) == 1 && val >= 0 && val < VINYL_PRESETS) g_vinyl = (int)val;
+        else if (sscanf(acc, "rain %f", &val) == 1 && val >= 0 && val < RAIN_PRESETS) g_rain = (int)val;
         size_t rest = used - (nl + 1 - acc);
         memmove(acc, nl + 1, rest);
         used = rest;
@@ -141,6 +148,18 @@ int main(int argc, char **argv) {
     g_speed = clampf(g_speed, 0.4f, 2.0f);
     g_reverb = clampf(g_reverb, 0.0f, 1.0f);
     g_bass = clampf(g_bass, 0.0f, 1.0f);
+    const char *vinyl_env = getenv("SPOTC_FX_VINYL");
+    if (vinyl_env) {
+        int vp = atoi(vinyl_env);
+        if (vp >= 0 && vp < VINYL_PRESETS) g_vinyl = vp;
+    }
+    const char *gain_env = getenv("SPOTC_FX_GAIN");
+    if (gain_env) g_gain = clampf(strtof(gain_env, NULL), 0.0f, 1.0f);
+    const char *rain_env = getenv("SPOTC_FX_RAIN");
+    if (rain_env) {
+        int rp = atoi(rain_env);
+        if (rp >= 0 && rp < RAIN_PRESETS) g_rain = rp;
+    }
     FILE *reverse_file = NULL;
     long long reverse_frames = 0;
     if (reverse_arg && argc > reverse_arg + 1) {
@@ -167,6 +186,14 @@ int main(int argc, char **argv) {
     float smooth_bass = g_bass, smooth_gain = g_gain;
     float bass_low[2] = {0};
     float cur_reverb_set = -1.0f;
+    static Vinyl vinyl;
+    vinyl_init(&vinyl);
+    int vinyl_preset = g_vinyl;
+    float vinyl_mix = g_vinyl ? 1.0f : 0.0f;
+    static Rain rain;
+    rain_init(&rain);
+    int rain_preset = g_rain;
+    float rain_mix = g_rain ? 1.0f : 0.0f;
 
     for (;;) {
         size_t got = reverse_file ? read_reverse(reverse_file, in, &reverse_frames)
@@ -197,7 +224,7 @@ int main(int argc, char **argv) {
                     cur_reverb_set = wet;
                 }
                 float t = (float)frac;
-                int16_t live[2];
+                float frame[2];
                 for (int ch = 0; ch < 2; ch++) {
                     float dry = hermite(hist[ch][0], hist[ch][1], hist[ch][2], hist[ch][3], t);
                     /* One-pole low band plus level compensation gives roughly
@@ -208,13 +235,34 @@ int main(int argc, char **argv) {
                                     bass_low[ch] * bass * 0.90f) /
                                    (1.0f + bass * 0.20f);
                     float w = verb_run(ch ? &vr : &vl, bassed * 0.015f);
-                    float s = bassed * (1.0f - wet * 0.35f) + w * wet;
+                    frame[ch] = bassed * (1.0f - wet * 0.35f) + w * wet;
+                }
+                /* fade the record in and out instead of switching hard */
+                int want = g_vinyl;
+                if (want) vinyl_preset = want;
+                vinyl_mix += ((want ? 1.0f : 0.0f) - vinyl_mix) * 0.0005f;
+                if (vinyl_mix > 0.0005f) {
+                    float dry[2] = { frame[0], frame[1] };
+                    vinyl_run(&vinyl, frame, speed, &vinyl_presets[vinyl_preset]);
+                    frame[0] = dry[0] + (frame[0] - dry[0]) * vinyl_mix;
+                    frame[1] = dry[1] + (frame[1] - dry[1]) * vinyl_mix;
+                }
+                int want_rain = g_rain;
+                if (want_rain) rain_preset = want_rain;
+                rain_mix += ((want_rain ? 1.0f : 0.0f) - rain_mix) * 0.0002f;
+                int raining = rain_mix > 0.0005f;
+                if (raining) {
+                    float drops[2] = { 0, 0 };
+                    rain_run(&rain, drops, &rain_presets[rain_preset]);
+                    frame[0] += drops[0] * rain_mix;
+                    frame[1] += drops[1] * rain_mix;
+                }
+                for (int ch = 0; ch < 2; ch++) {
+                    float s = raining ? rain_soft_limit(frame[ch]) : frame[ch];
                     if (s > 1.0f) s = 1.0f;
                     if (s < -1.0f) s = -1.0f;
-                    live[ch] = (int16_t)(s * 32767.0f * smooth_gain);
+                    out[nout * 2 + ch] = (int16_t)(s * 32767.0f * smooth_gain);
                 }
-                out[nout * 2] = live[0];
-                out[nout * 2 + 1] = live[1];
                 nout++;
                 frac += speed;
                 if (nout >= CHUNK * 4 - 2) break;

@@ -43,6 +43,16 @@ static char *self_dir(void) {
     return dir;
 }
 
+/* spotc-fx reads its starting record preset from the environment, so the
+ * positional arguments stay compatible with older builds. */
+static void set_vinyl_env(const App *a) {
+    char v[8];
+    snprintf(v, sizeof v, "%d", a->vinyl);
+    setenv("SPOTC_FX_VINYL", v, 1);
+    snprintf(v, sizeof v, "%d", a->rain);
+    setenv("SPOTC_FX_RAIN", v, 1);
+}
+
 static int start_pipeline(App *a, int oauth) {
     const char *lrs = player_librespot_path();
     if (!lrs) return -1;
@@ -106,6 +116,7 @@ static int start_pipeline(App *a, int oauth) {
         dup2(p2[1], 1);
         close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
         if (logfd >= 0) close(logfd);
+        set_vinyl_env(a);
         execl(fx_bin, "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
         execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
         _exit(127);
@@ -147,7 +158,41 @@ static int valid_track_id(const char *id) {
 /* Decode the complete track independently of Spotify Connect.  Since the
  * helper writes to a regular file, librespot is not paced by an audio device
  * and normally finishes in a few seconds. */
+/* local file: ffmpeg decodes the whole file once into the reverse cache */
+static int cache_reverse_local(App *a, char *path, size_t n) {
+    char dir[700], tmp[800], hex[24];
+    snprintf(dir, sizeof dir, "%s/reverse", cache_dir());
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
+    local_hash(a->now.path, hex, sizeof hex);
+    snprintf(path, n, "%s/local-%s.s16", dir, hex);
+    struct stat st, src;
+    if (stat(path, &st) == 0 && st.st_size > 44100 * 4 &&
+        stat(a->now.path, &src) == 0 && st.st_mtime >= src.st_mtime)
+        return 0;
+    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+    unlink(tmp);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+        execlp("ffmpeg", "ffmpeg", "-v", "error", "-nostdin", "-y", "-i", a->now.path,
+               "-f", "s16le", "-ar", "44100", "-ac", "2", tmp, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) return -1;
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        stat(tmp, &st) != 0 || st.st_size < 44100 * 4 || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 1;
+}
+
 int player_cache_reverse(App *a, char *path, size_t n) {
+    if (a->now.path[0]) return cache_reverse_local(a, path, n);
     if (!valid_track_id(a->now.id) || !a->now.uri[0]) return -1;
 
     char dir[700], tmp[800], helper[700], lrs_cache[700], logp[700];
@@ -223,6 +268,7 @@ int player_start_reverse(App *a, const char *path) {
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         dup2(p2[1], 1);
         close(p2[0]); close(p2[1]);
+        set_vinyl_env(a);
         execl(fx_bin, "spotc-fx", fifo_path, spd, rev, bass,
               "--reverse-file", path, gain, (char *)NULL);
         execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, bass,
@@ -257,8 +303,82 @@ int player_start_reverse(App *a, const char *path) {
     return 0;
 }
 
+int player_start_local(App *a, const char *path, int start_ms) {
+    if (a->pipeline_up) return -1;
+
+    char fx_bin[700], spd[16], rev[16], bass[16], gain[16], ss[32], logp[700];
+    snprintf(fx_bin, sizeof fx_bin, "%s/spotc-fx", self_dir());
+    if (access(fx_bin, X_OK) != 0) snprintf(fx_bin, sizeof fx_bin, "spotc-fx");
+    snprintf(spd, sizeof spd, "%.3f", a->speed * a->retune);
+    snprintf(rev, sizeof rev, "%.3f", a->reverb);
+    snprintf(bass, sizeof bass, "%.3f", a->bass);
+    snprintf(gain, sizeof gain, "%.3f", a->volume / 100.0f);
+    snprintf(ss, sizeof ss, "%.3f", start_ms > 0 ? start_ms / 1000.0 : 0.0);
+    snprintf(logp, sizeof logp, "%s/local.log", cache_dir());
+
+    snprintf(fifo_path, sizeof fifo_path, "%s/fx.ctl", cache_dir());
+    unlink(fifo_path);
+    if (mkfifo(fifo_path, 0600) != 0) return -1;
+
+    int p1[2], p2[2];
+    if (pipe(p1) != 0) return -1;
+    if (pipe(p2) != 0) { close(p1[0]); close(p1[1]); return -1; }
+    memset(pids, 0, sizeof pids);
+
+    pids[0] = fork();
+    if (pids[0] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        dup2(p1[1], 1);
+        int logfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) dup2(devnull, 0);
+        if (logfd >= 0) dup2(logfd, 2);
+        close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+        execlp("ffmpeg", "ffmpeg", "-v", "error", "-nostdin", "-ss", ss, "-i", path,
+               "-f", "s16le", "-ar", "44100", "-ac", "2", "-", (char *)NULL);
+        _exit(127);
+    }
+
+    pids[1] = fork();
+    if (pids[1] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        dup2(p1[0], 0);
+        dup2(p2[1], 1);
+        close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+        set_vinyl_env(a);
+        setenv("SPOTC_FX_GAIN", gain, 1);
+        execl(fx_bin, "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
+        execlp("spotc-fx", "spotc-fx", fifo_path, spd, rev, bass, (char *)NULL);
+        _exit(127);
+    }
+
+    pids[2] = fork();
+    if (pids[2] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        dup2(p2[0], 0);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+        execlp("pacat", "pacat", "--playback", "--raw",
+               "--format=s16le", "--rate=44100", "--channels=2",
+               "--latency-msec=120", "--process-time-msec=20",
+               "--client-name=spotc", "--stream-name=spotc-local",
+               (char *)NULL);
+        _exit(127);
+    }
+
+    close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+    if (pids[0] < 0 || pids[1] < 0 || pids[2] < 0) {
+        a->pipeline_up = 1;
+        player_stop(a);
+        return -1;
+    }
+    a->pipeline_up = 1;
+    return 0;
+}
+
 void player_reverse_pause(App *a, int paused) {
-    if (!a->reverse || !a->pipeline_up || pids[1] <= 0) return;
+    if ((!a->reverse && !a->local) || !a->pipeline_up || pids[1] <= 0) return;
     kill(pids[1], paused ? SIGSTOP : SIGCONT);
 }
 
@@ -314,7 +434,7 @@ int player_check(App *a) {
     /* In whole-track reverse mode the FX reader finishes first.  Let pacat
      * drain its final buffered samples and close naturally before declaring
      * the track complete. */
-    if (a->reverse && pids[2] > 0) return 0;
+    if ((a->reverse || a->local) && pids[2] > 0) return 0;
     player_stop(a);
     return 1;
 }
@@ -339,9 +459,9 @@ void player_set_fx(App *a) {
     if (fd < 0) return;
     char msg[128];
     int n = snprintf(msg, sizeof msg,
-                     "speed %.3f\nreverb %.3f\nbass %.3f\ngain %.3f\n",
+                     "speed %.3f\nreverb %.3f\nbass %.3f\ngain %.3f\nvinyl %d\nrain %d\n",
                      a->speed * a->retune, a->reverb, a->bass,
-                     a->reverse ? a->volume / 100.0f : 1.0f);
+                     a->reverse || a->local ? a->volume / 100.0f : 1.0f, a->vinyl, a->rain);
     ssize_t w = write(fd, msg, n);
     (void)w;
     close(fd);

@@ -33,6 +33,16 @@ Requires Spotify Premium.
   transitions
 - Toggleable bass boost and a Freeverb implementation, both applied live to
   normal and reverse local audio; exact values can also be set in the config
+- Vinyl record sound (`v` cycles off / mint / played / dusty / lo-fi): crackle,
+  pops, scratches that tick once per revolution, wow & flutter tied to the
+  platter speed, warm rolled-off top end with mono bass, hiss and rumble
+- Rain sounds (`w` cycles off / drizzle / rain / storm): procedural noise bed,
+  droplets, splats and distant thunder in a storm, mixed after the effects so
+  they never slow down
+- Local files: a "Local files" entry lists `music_dir` (default `~/Music`,
+  scanned recursively; tags via ffprobe, cached); playback goes
+  ffmpeg → spotc-fx → pacat, so every effect, seeking, next/prev and reverse
+  work on your own files too
 - Continuous exact-reverse mode for the local device: each track is decoded
   once, cached and played from its last sample to its first; the next track is
   then started automatically in reverse too
@@ -68,6 +78,7 @@ device never appears. Harmless when IPv6 works.
 - [librespot](https://github.com/librespot-org/librespot) ≥ 0.8 —
   `cargo install librespot --locked` (without `--locked` the build fails)
 - `pacat` (pulseaudio-utils; PipeWire's pulse compatibility works fine)
+- `ffmpeg` / `ffprobe` for local files (optional)
 
 ## Build
 

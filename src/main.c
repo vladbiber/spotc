@@ -82,10 +82,22 @@ static void capture_reverse_queue(App *a, int selected) {
     }
 }
 
+static int play_local_at(App *a, int start_ms, int play);
+static void capture_local_queue(App *a, int selected);
+static int local_position(const App *a);
+
 static void leave_reverse(App *a, int target, int play) {
     player_stop(a);
     a->reverse = 0;
     clear_reverse_queue(a);
+    if (a->now.path[0]) {
+        int sel = -1;
+        for (int i = 0; i < a->n_tracks; i++)
+            if (!strcmp(a->tracks[i].id, a->now.id)) { sel = i; break; }
+        capture_local_queue(a, sel);
+        play_local_at(a, target, play);
+        return;
+    }
     a->playing = 0;
     a->progress_ms = target;
     a->state_at_ms = now_ms();
@@ -151,15 +163,22 @@ static void start_reverse(App *a) {
         set_status(a, "start a track before using reverse");
         return;
     }
-    if (strcmp(a->active_device, a->cfg.device_name)) {
+    int from_local = a->local;
+    if (!from_local && strcmp(a->active_device, a->cfg.device_name)) {
         set_status(a, "reverse only works on the local '%s' device (d)", a->cfg.device_name);
         return;
     }
 
     int was_playing = a->playing;
     int forward_pos = a->progress_ms;
-    if (was_playing) forward_pos += (int)(now_ms() - a->state_at_ms);
-    if (was_playing && api_pause(a) != 0) return;
+    if (from_local) {
+        forward_pos = local_position(a);
+        player_stop(a);
+        a->local = 0;
+    } else {
+        if (was_playing) forward_pos += (int)(now_ms() - a->state_at_ms);
+        if (was_playing && api_pause(a) != 0) return;
+    }
     a->playing = 0;
     a->progress_ms = forward_pos;
     a->reverse_was_playing = was_playing;
@@ -168,6 +187,10 @@ static void start_reverse(App *a) {
     if (launch_reverse_current(a) == 0) return;
     if (!a->reverse) {
         clear_reverse_queue(a);
+        if (from_local) {
+            play_local_at(a, forward_pos, was_playing);
+            return;
+        }
         if (was_playing && api_resume(a) == 0) {
             a->playing = 1;
             a->state_at_ms = now_ms();
@@ -243,15 +266,137 @@ static void pipeline_died(App *a) {
     set_status(a, "librespot exited — see ~/.cache/spotc/librespot.log; reload retries");
 }
 
+/* ---- local files -------------------------------------------------- */
+
+static int local_position(const App *a) {
+    int pos = a->progress_ms;
+    if (a->playing) pos += (int)((now_ms() - a->state_at_ms) * a->speed * a->retune);
+    if (pos < 0) pos = 0;
+    if (a->now.duration_ms && pos > a->now.duration_ms) pos = a->now.duration_ms;
+    return pos;
+}
+
+static void clear_local_queue(App *a) {
+    free(a->local_queue);
+    a->local_queue = NULL;
+    a->n_local_queue = 0;
+    a->local_index = -1;
+}
+
+static void capture_local_queue(App *a, int selected) {
+    clear_local_queue(a);
+    a->local_queue = malloc((size_t)(a->n_tracks ? a->n_tracks : 1) * sizeof *a->local_queue);
+    if (!a->local_queue) return;
+    if (a->n_tracks && a->tracks_kind == TRACKS_LOCAL) {
+        memcpy(a->local_queue, a->tracks, (size_t)a->n_tracks * sizeof *a->local_queue);
+        a->n_local_queue = a->n_tracks;
+        a->local_index = selected;
+    } else {
+        a->local_queue[0] = a->now;
+        a->n_local_queue = 1;
+        a->local_index = 0;
+    }
+}
+
+/* Play a->now.path from start_ms through ffmpeg | spotc-fx | pacat. The
+ * librespot pipeline is stopped meanwhile, like in reverse mode. */
+static int play_local_at(App *a, int start_ms, int play) {
+    if (!a->local && !a->reverse && a->playing && a->have_state) api_pause(a);
+    player_stop(a);
+    if (!a->have_state && a->volume <= 0) a->volume = 100;
+    a->local = 1;
+    a->have_state = 1;
+    a->progress_ms = start_ms;
+    a->state_at_ms = now_ms();
+    a->local_started_ms = now_ms();
+    if (player_start_local(a, a->now.path, start_ms) != 0) {
+        a->playing = 0;
+        set_status(a, "could not start ffmpeg/pacat for this file");
+        return -1;
+    }
+    a->playing = 1;
+    if (!play) {
+        a->playing = 0;
+        player_reverse_pause(a, 1);
+    }
+    for (int i = 0; i < a->n_tracks; i++)
+        if (!strcmp(a->tracks[i].id, a->now.id)) { a->tr_sel = i; break; }
+    set_status(a, "local: %s", a->now.name);
+    return 0;
+}
+
+static void leave_local(App *a) {
+    if (!a->local) return;
+    player_stop(a);
+    a->local = 0;
+    clear_local_queue(a);
+    a->playing = 0;
+    a->have_state = 0;
+    memset(&a->now, 0, sizeof a->now);
+    if (pipeline_start(a) != 0)
+        set_status(a, "librespot could not restart");
+    a->last_poll_ms = now_ms() - 2000;
+}
+
+static void change_local_track(App *a, int direction, int automatic) {
+    if (a->n_local_queue <= 0) return;
+    int next = a->local_index;
+    if (automatic && a->repeat == 2) {
+        /* same track again */
+    } else if (a->shuffle && a->n_local_queue > 1) {
+        do next = rand() % a->n_local_queue; while (next == a->local_index);
+    } else {
+        next += direction;
+        if (next < 0 || next >= a->n_local_queue) {
+            if (a->repeat != 1) {
+                if (automatic) {
+                    player_stop(a);
+                    a->playing = 0;
+                    a->progress_ms = a->now.duration_ms;
+                    a->state_at_ms = now_ms();
+                }
+                set_status(a, automatic ? "end of local list" : "no more tracks in this direction");
+                return;
+            }
+            next = direction > 0 ? 0 : a->n_local_queue - 1;
+        }
+    }
+    a->local_index = next;
+    a->now = a->local_queue[next];
+    play_local_at(a, 0, 1);
+}
+
+static void open_local(App *a) {
+    if (!a->local_lib) {
+        set_status(a, "scanning %s...", a->cfg.music_dir);
+        ui_draw(a);
+        local_scan(a);
+    }
+    free(a->tracks);
+    a->tracks = malloc((size_t)(a->n_local_lib ? a->n_local_lib : 1) * sizeof *a->tracks);
+    a->n_tracks = 0;
+    if (!a->tracks) return;
+    memcpy(a->tracks, a->local_lib, (size_t)a->n_local_lib * sizeof *a->tracks);
+    a->n_tracks = a->n_local_lib;
+    a->tr_sel = a->tr_off = 0;
+    a->tracks_kind = TRACKS_LOCAL;
+    snprintf(a->tracks_title, sizeof a->tracks_title, "Local files (%.150s)", a->cfg.music_dir);
+    a->tracks_ctx[0] = 0;
+    if (a->n_tracks) set_status(a, "");
+    else if (!a->status[0]) set_status(a, "no audio files in %s", a->cfg.music_dir);
+    a->focus = FOCUS_TRACKS;
+}
+
 static void open_sidebar_sel(App *a) {
+    if (a->pl_sel == 0) { open_local(a); return; }
     set_status(a, "loading...");
     ui_draw(a);
     int rc;
-    if (a->pl_sel == 0) rc = api_load_liked(a);
-    else if (a->pl_sel <= a->n_albums)
-        rc = api_load_album_tracks(a, &a->albums[a->pl_sel - 1]);
+    if (a->pl_sel == 1) rc = api_load_liked(a);
+    else if (a->pl_sel <= 1 + a->n_albums)
+        rc = api_load_album_tracks(a, &a->albums[a->pl_sel - 2]);
     else
-        rc = api_load_playlist_tracks(a, &a->playlists[a->pl_sel - 1 - a->n_albums]);
+        rc = api_load_playlist_tracks(a, &a->playlists[a->pl_sel - 2 - a->n_albums]);
     if (!rc) set_status(a, "");
     if (!rc) a->focus = FOCUS_TRACKS;
 }
@@ -281,9 +426,22 @@ static void play_selected(App *a) {
         launch_reverse_current(a);
         return;
     }
+    if (t->path[0]) {
+        a->now = *t;
+        capture_local_queue(a, a->tr_sel);
+        play_local_at(a, 0, 1);
+        return;
+    }
     /* no active device? play straight on the local spotc device */
     const char *dev = NULL;
-    if (!a->have_state || !a->active_device[0]) {
+    char local_dev[128];
+    if (a->local) {
+        leave_local(a);
+        set_status(a, "back to Spotify...");
+        ui_draw(a);
+        if (wait_local_device(a, local_dev, sizeof local_dev) == 0) dev = local_dev;
+    }
+    if (!dev && (!a->have_state || !a->active_device[0])) {
         api_fetch_devices(a);
         for (int i = 0; i < a->n_devices; i++)
             if (!strcmp(a->devices[i].name, a->cfg.device_name)) {
@@ -326,7 +484,7 @@ static void set_fx(App *a, float speed, float reverb, float bass) {
     a->cfg.reverb = a->reverb;
     a->cfg.bass = a->bass;
     config_save(&a->cfg);
-    if (!a->pipeline_up || (!a->reverse && strcmp(a->active_device, a->cfg.device_name)))
+    if (!a->pipeline_up || (!a->reverse && !a->local && strcmp(a->active_device, a->cfg.device_name)))
         set_status(a, "local effects apply when playing on '%s' (d)", a->cfg.device_name);
 }
 
@@ -386,7 +544,7 @@ static void step_speed(App *a, int direction) {
             if (speeds[i] < a->speed - 0.005f) { target = speeds[i]; break; }
     }
     set_fx(a, target, a->reverb, a->bass);
-    if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name))) {
+    if (a->pipeline_up && (a->reverse || a->local || !strcmp(a->active_device, a->cfg.device_name))) {
         const char *limit = direction > 0 && target >= 1.999f ? " (maximum)" :
                             direction < 0 && target <= 0.501f ? " (minimum)" : "";
         set_status(a, "speed %.2fx%s%s", target, limit,
@@ -397,13 +555,42 @@ static void step_speed(App *a, int direction) {
 static void toggle_bass(App *a) {
     float bass = a->bass > 0.001f ? 0.0f : 1.0f;
     set_fx(a, a->speed, a->reverb, bass);
-    if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name)))
+    if (a->pipeline_up && (a->reverse || a->local || !strcmp(a->active_device, a->cfg.device_name)))
         set_status(a, bass > 0.0f ? "bass boost on" : "bass boost off");
+}
+
+static const char *const vinyl_names[] = { "off", "mint", "played", "dusty", "lo-fi" };
+
+static void cycle_vinyl(App *a) {
+    latch_reverse_position(a);
+    a->vinyl = (a->vinyl + 1) % 5;
+    a->cfg.vinyl = a->vinyl;
+    player_set_fx(a);
+    config_save(&a->cfg);
+    if (a->pipeline_up && (a->reverse || a->local || !strcmp(a->active_device, a->cfg.device_name)))
+        set_status(a, a->vinyl ? "vinyl sound: %s record" : "vinyl sound off", vinyl_names[a->vinyl]);
+    else
+        set_status(a, "local effects apply when playing on '%s' (d)", a->cfg.device_name);
+}
+
+static const char *const rain_names[] = { "off", "drizzle", "rain", "storm" };
+
+static void cycle_rain(App *a) {
+    a->rain = (a->rain + 1) % 4;
+    a->cfg.rain = a->rain;
+    player_set_fx(a);
+    config_save(&a->cfg);
+    if (a->pipeline_up && (a->reverse || a->local || !strcmp(a->active_device, a->cfg.device_name)))
+        set_status(a, a->rain ? "rain sounds: %s" : "rain sounds off", rain_names[a->rain]);
+    else
+        set_status(a, "local effects apply when playing on '%s' (d)", a->cfg.device_name);
 }
 
 static void logout(App *a) {
     player_stop(a);
     clear_reverse_queue(a);
+    clear_local_queue(a);
+    a->local = 0;
     auth_logout(a);
     a->have_state = a->playing = 0;
     a->reverse = 0;
@@ -420,7 +607,7 @@ static void request_volume(App *a, int delta) {
     int target = base + delta;
     if (target < 0) target = 0;
     if (target > 100) target = 100;
-    if (a->reverse) {
+    if (a->reverse || a->local) {
         a->volume = target;
         a->volume_target = -1;
         player_set_fx(a);
@@ -450,6 +637,13 @@ static void seek_rel(App *a, int delta_ms) {
     if (!a->have_state || !a->now.duration_ms) return;
     if (a->reverse) {
         set_status(a, "seek is unavailable during exact reverse; R returns to normal");
+        return;
+    }
+    if (a->local) {
+        int target = local_position(a) + delta_ms;
+        if (target > a->now.duration_ms - 1000) target = a->now.duration_ms - 1000;
+        if (target < 0) target = 0;
+        play_local_at(a, target, a->playing);
         return;
     }
     int prog = a->progress_ms;
@@ -526,6 +720,16 @@ static void handle_key(App *a, int ch) {
                 player_reverse_pause(a, !a->playing);
                 a->state_at_ms = now_ms();
             }
+        } else if (a->local) {
+            if (!a->pipeline_up) {
+                int pos = local_position(a);
+                play_local_at(a, pos >= a->now.duration_ms - 500 ? 0 : pos, 1);
+            } else {
+                a->progress_ms = local_position(a);
+                a->state_at_ms = now_ms();
+                a->playing = !a->playing;
+                player_reverse_pause(a, !a->playing);
+            }
         } else if (a->playing) { if (!api_pause(a)) { a->playing = 0;
             a->progress_ms += (int)(now_ms() - a->state_at_ms); } }
         else if (!api_resume(a)) { a->playing = 1; a->state_at_ms = now_ms(); }
@@ -535,12 +739,17 @@ static void handle_key(App *a, int ch) {
     } else if (key_is(ch, a->cfg.key_next)) {
         if (a->reverse) {
             change_reverse_track(a, +1, 0);
+        } else if (a->local) {
+            change_local_track(a, +1, 0);
         } else if (!api_next(a)) {
             a->last_poll_ms = now_ms() - 1500;
         }
     } else if (key_is(ch, a->cfg.key_prev)) {
         if (a->reverse) {
             change_reverse_track(a, -1, 0);
+        } else if (a->local) {
+            if (local_position(a) > 3000) play_local_at(a, 0, 1);
+            else change_local_track(a, -1, 0);
         } else if (!api_prev(a)) {
             a->last_poll_ms = now_ms() - 1500;
         }
@@ -553,9 +762,10 @@ static void handle_key(App *a, int ch) {
     } else if (key_is(ch, a->cfg.key_volume_up)) {
         request_volume(a, +5);
     } else if (key_is(ch, a->cfg.key_shuffle)) {
-        if (!api_set_shuffle(a, !a->shuffle)) a->shuffle = !a->shuffle;
+        if (a->local || a->reverse || !api_set_shuffle(a, !a->shuffle)) a->shuffle = !a->shuffle;
     } else if (key_is(ch, a->cfg.key_repeat)) {
-        if (!api_set_repeat(a, (a->repeat + 1) % 3)) a->repeat = (a->repeat + 1) % 3;
+        if (a->local || a->reverse || !api_set_repeat(a, (a->repeat + 1) % 3))
+            a->repeat = (a->repeat + 1) % 3;
     } else if (key_is(ch, a->cfg.key_reverse)) {
         if (a->reverse)
             leave_reverse(a, reverse_position(a), a->reverse_was_playing);
@@ -572,12 +782,16 @@ static void handle_key(App *a, int ch) {
         step_speed(a, -1);
     } else if (key_is(ch, a->cfg.key_bass_boost)) {
         toggle_bass(a);
+    } else if (key_is(ch, a->cfg.key_vinyl)) {
+        cycle_vinyl(a);
+    } else if (key_is(ch, a->cfg.key_rain)) {
+        cycle_rain(a);
     } else if (key_is(ch, a->cfg.key_fx_reset)) {
         latch_reverse_position(a);
         a->retune = 1.0f;
         a->cfg.retune = 1.0f;
         set_fx(a, 1.0f, 0.0f, 0.0f);
-        if (a->pipeline_up && (a->reverse || !strcmp(a->active_device, a->cfg.device_name)))
+        if (a->pipeline_up && (a->reverse || a->local || !strcmp(a->active_device, a->cfg.device_name)))
             set_status(a, "local effects reset");
     } else if (key_is(ch, a->cfg.key_retune)) {
         a->popup = POPUP_RETUNE;
@@ -589,7 +803,10 @@ static void handle_key(App *a, int ch) {
     } else if (key_is(ch, a->cfg.key_help)) {
         a->popup = POPUP_HELP;
     } else if (key_is(ch, a->cfg.key_reload)) {
-        int pipeline_ok = a->pipeline_up || pipeline_start(a) == 0;
+        free(a->local_lib);
+        a->local_lib = NULL;
+        a->n_local_lib = 0;
+        int pipeline_ok = a->pipeline_up || a->local || pipeline_start(a) == 0;
         int playlists_ok = api_load_playlists(a) == 0;
         int albums_ok = api_load_albums(a) == 0;
         if (playlists_ok && albums_ok)
@@ -619,7 +836,10 @@ int main(void) {
     a.reverb = a.cfg.reverb;
     a.bass = a.cfg.bass;
     a.retune = a.cfg.retune;
+    a.vinyl = a.cfg.vinyl;
+    a.rain = a.cfg.rain;
     signal(SIGPIPE, SIG_IGN);
+    srand((unsigned)time(NULL));
 
     /* stale tokens minted with a different client id must not short-circuit login */
     int logged = a.cfg.client_id[0] && tokens_load(&a.tok) == 0
@@ -666,17 +886,22 @@ int main(void) {
 
         if (player_check(&a)) {
             if (a.reverse) change_reverse_track(&a, +1, 1);
+            else if (a.local && now_ms() - a.local_started_ms < 1500) {
+                a.playing = 0;
+                set_status(&a, "could not play this file — see ~/.cache/spotc/local.log");
+            } else if (a.local) change_local_track(&a, +1, 1);
             else pipeline_died(&a);
         }
         flush_volume(&a);
 
-        if (!a.reverse && now_ms() - a.last_poll_ms > 2500)
+        if (!a.reverse && !a.local && now_ms() - a.last_poll_ms > 2500)
             api_fetch_state(&a);
     }
 
     ui_shutdown();
     player_stop(&a);
     clear_reverse_queue(&a);
+    clear_local_queue(&a);
     curl_global_cleanup();
     return 0;
 }

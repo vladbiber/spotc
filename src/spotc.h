@@ -25,12 +25,15 @@ typedef struct {
     float reverb;
     float bass;      /* 0.0 = off, 1.0 = full bass boost */
     float retune;    /* tuning ratio, 1.0 = A4 440 Hz */
+    int vinyl;       /* record preset: 0 off, 1 mint, 2 played, 3 dusty, 4 lo-fi */
+    int rain;        /* rain preset: 0 off, 1 drizzle, 2 rain, 3 storm */
+    char music_dir[512]; /* local files root, ~ expanded on use */
 
     /* All textual controls can be changed in ~/.config/spotc/config. */
     int key_quit, key_focus, key_down, key_up, key_top, key_bottom;
     int key_play_pause, key_next, key_prev, key_seek_back, key_seek_forward;
     int key_volume_down, key_volume_up, key_shuffle, key_repeat, key_reverse, key_queue;
-    int key_speed_up, key_speed_down, key_bass_boost, key_fx_reset, key_retune;
+    int key_speed_up, key_speed_down, key_bass_boost, key_fx_reset, key_retune, key_vinyl, key_rain;
     int key_search, key_devices, key_help, key_reload, key_logout;
     int key_client_id, key_login;
 } Config;
@@ -57,6 +60,7 @@ typedef struct {
     char album[192];
     int duration_ms;
     int is_album;       /* search result row that opens an album */
+    char path[512];     /* local file; empty for Spotify tracks */
 } Track;
 
 typedef struct {
@@ -70,7 +74,7 @@ typedef struct {
 enum { FOCUS_SIDEBAR, FOCUS_TRACKS };
 enum { POPUP_NONE, POPUP_DEVICES, POPUP_HELP, POPUP_RETUNE };
 enum { SCREEN_LOGIN, SCREEN_MAIN };
-enum { TRACKS_NONE, TRACKS_PLAYLIST, TRACKS_LIKED, TRACKS_SEARCH };
+enum { TRACKS_NONE, TRACKS_PLAYLIST, TRACKS_LIKED, TRACKS_SEARCH, TRACKS_LOCAL };
 
 typedef struct App {
     Config cfg;
@@ -84,7 +88,7 @@ typedef struct App {
     int n_playlists;
     Playlist *albums;
     int n_albums;
-    int pl_sel, pl_off;          /* sidebar: 0 = Liked, then albums, then playlists */
+    int pl_sel, pl_off;          /* sidebar: 0 = Local, 1 = Liked, then albums, playlists */
 
     Track *tracks;
     int n_tracks;
@@ -119,6 +123,8 @@ typedef struct App {
     float reverb;
     float bass;
     float retune;    /* multiplies speed in the fx chain, never shown as "slow" */
+    int vinyl;
+    int rain;
     int reverse;     /* continuous exact-reverse mode is enabled */
     int reverse_was_playing;
     int reverse_progress_ms;
@@ -126,15 +132,20 @@ typedef struct App {
     int n_reverse_tracks;
     int reverse_index;
 
+    /* local files */
+    int local;              /* ffmpeg | spotc-fx | pacat is playing a->now.path */
+    Track *local_lib;       /* scanned music_dir, NULL = not scanned yet */
+    int n_local_lib;
+    Track *local_queue;     /* list the playing local track came from */
+    int n_local_queue;
+    int local_index;
+    long long local_started_ms;
+
     char status[256];
 } App;
 
-/* "magic Hz" retune presets: the nearest equal-temperament note is tuned to
- * hit the target, the way real solfeggio converters do — a naive A4 jump to
- * 174/963 would mean 0.4x/2.2x playback. The "deep" presets DO drag A4 itself
- * down, giving slowed-vibe playback, and carry their own reverb (reverb never
- * shifts pitch, so the Hz stays exact). Index 0 = off, indexes match the
- * digit pressed in the retune popup. */
+/* "magic Hz" presets: the nearest note is retuned onto the target. The deep
+ * presets also lower A4 and add reverb. Index 0 = off. */
 typedef struct {
     int hz;
     const char *note;
@@ -146,7 +157,7 @@ typedef struct {
 extern const RetunePreset retune_presets[RETUNE_PRESETS];
 
 static inline int sidebar_total(const App *a) {
-    return 1 + a->n_albums + a->n_playlists;
+    return 2 + a->n_albums + a->n_playlists;
 }
 
 /* util */
@@ -170,7 +181,7 @@ int auth_ensure(App *a);             /* refresh/mint if near expiry; 0 = have va
 int auth_have_creds(App *a);         /* librespot session credentials cached? */
 void auth_logout(App *a);            /* forget Web API and librespot credentials */
 
-/* api.c — all return 0 on success unless noted */
+/* api.c: all return 0 on success unless noted */
 json_object *api_get(App *a, const char *path);
 int api_send(App *a, const char *method, const char *path, const char *body);
 int api_load_playlists(App *a);
@@ -197,11 +208,16 @@ int api_set_shuffle(App *a, int on);
 int api_set_repeat(App *a, int mode);
 int api_queue_add(App *a, const char *uri);
 
+/* local.c */
+int local_scan(App *a);              /* fill a->local_lib from music_dir */
+void local_hash(const char *path, char *hex, size_t n);
+
 /* player.c */
 int player_start(App *a);            /* spawn librespot | spotc-fx | pacat */
 int player_cache_reverse(App *a, char *path, size_t n); /* decode current track */
 int player_start_reverse(App *a, const char *path);     /* reverse file | pacat */
 void player_reverse_pause(App *a, int paused);
+int player_start_local(App *a, const char *path, int start_ms); /* ffmpeg | fx | pacat */
 int player_oauth_login(App *a);      /* librespot -j browser sign-in; 0 on success */
 int player_check(App *a);            /* reap children; 1 = pipeline died */
 void player_stop(App *a);
